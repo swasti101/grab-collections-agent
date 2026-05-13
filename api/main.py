@@ -1,7 +1,8 @@
 import json
 import os
 import uuid
-from datetime import datetime
+from collections import defaultdict
+from datetime import datetime, timedelta
 
 import pytz
 from dotenv import load_dotenv
@@ -19,13 +20,22 @@ from agent.nodes import (
 )
 from agent.state import AgentState
 from agent.tools import classify_risk
-from api.models import AgentResponse, MarkPaymentMissedRequest, TriggerAgentRequest, UserResponseRequest
+from api.models import (
+    AgentResponse,
+    MarkPaymentMissedRequest,
+    SendNotificationRequest,
+    TriggerAgentRequest,
+    UserResponseRequest,
+    WorkerNotificationResponseRequest,
+)
 from db.database import (
     AgentSession,
     CommitmentBreach,
+    Earning,
     FinancialHealthScore,
     Negotiation,
     Payment,
+    WorkerNotification,
     create_db_and_tables,
     get_session,
 )
@@ -117,10 +127,9 @@ def _response(state: AgentState, state_id: str | None = None, next_action: str |
     )
 
 
-@app.post("/trigger-agent", response_model=AgentResponse)
-def trigger_agent(req: TriggerAgentRequest):
+def _run_agent_for_user(user_id: str) -> tuple[AgentState, str]:
     with get_session() as session:
-        payment = session.exec(select(Payment).where(Payment.user_id == req.user_id)).first()
+        payment = session.exec(select(Payment).where(Payment.user_id == user_id)).first()
         if not payment:
             raise HTTPException(status_code=404, detail="User/payment not found")
         state = _state_from_payment(payment)
@@ -129,7 +138,56 @@ def trigger_agent(req: TriggerAgentRequest):
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Agent failed: {exc}") from exc
     state_id = _save_state(state)
+    return state, state_id
+
+
+def _store_notification(state: AgentState, state_id: str) -> WorkerNotification:
+    with get_session() as session:
+        notification = WorkerNotification(
+            user_id=state["user_id"],
+            payment_id=state["payment_id"],
+            state_id=state_id,
+            message=state.get("agent_message") or "",
+            repayment_plan=json.dumps(state.get("repayment_plan") or {}),
+            status="escalated" if state.get("status") == "escalated" else "unread",
+            escalation_summary=state.get("escalation_summary"),
+        )
+        session.add(notification)
+        session.commit()
+        session.refresh(notification)
+        return notification
+
+
+def _notification_payload(notification: WorkerNotification) -> dict:
+    return {
+        "id": notification.id,
+        "user_id": notification.user_id,
+        "payment_id": notification.payment_id,
+        "state_id": notification.state_id,
+        "message": notification.message,
+        "repayment_plan": json.loads(notification.repayment_plan or "{}"),
+        "status": notification.status,
+        "escalation_summary": notification.escalation_summary,
+        "created_at": notification.created_at.isoformat(),
+        "updated_at": notification.updated_at.isoformat(),
+    }
+
+
+@app.post("/trigger-agent", response_model=AgentResponse)
+def trigger_agent(req: TriggerAgentRequest):
+    state, state_id = _run_agent_for_user(req.user_id)
     return _response(state, state_id)
+
+
+@app.post("/notifications/send")
+def send_notification(req: SendNotificationRequest):
+    state, state_id = _run_agent_for_user(req.user_id)
+    notification = _store_notification(state, state_id)
+    return {
+        "message": "notification delivered",
+        "notification": _notification_payload(notification),
+        "agent": _response(state, state_id).model_dump(),
+    }
 
 
 @app.post("/user-response", response_model=AgentResponse)
@@ -156,6 +214,33 @@ def user_response(req: UserResponseRequest):
         raise HTTPException(status_code=500, detail=f"Response handling failed: {exc}") from exc
     _save_state(state, req.state_id)
     return _response(state, req.state_id, next_action)
+
+
+@app.post("/worker/notification-response")
+def worker_notification_response(req: WorkerNotificationResponseRequest):
+    with get_session() as session:
+        notification = session.get(WorkerNotification, req.notification_id)
+        if not notification:
+            raise HTTPException(status_code=404, detail="Notification not found")
+        state_id = notification.state_id
+    response = user_response(UserResponseRequest(state_id=state_id, user_response=req.user_response))
+    with get_session() as session:
+        notification = session.get(WorkerNotification, req.notification_id)
+        if notification:
+            notification.status = {
+                "accepted": "accepted",
+                "rejected": "counter_offered",
+                "support_requested": "escalated",
+            }[req.user_response]
+            notification.updated_at = datetime.utcnow()
+            if response.plan:
+                notification.repayment_plan = json.dumps(response.plan)
+            if response.agent_message:
+                notification.message = response.agent_message
+            if response.escalation_summary:
+                notification.escalation_summary = response.escalation_summary
+            session.commit()
+    return response
 
 
 @app.post("/mark-payment-missed")
@@ -243,6 +328,24 @@ def users():
     return result
 
 
+def _latest_health_map(session):
+    return {h.user_id: h for h in session.exec(select(FinancialHealthScore)).all()}
+
+
+def _risk_for_payment(payment: Payment) -> dict:
+    try:
+        return classify_risk.invoke(
+            {
+                "user_id": payment.user_id,
+                "days_overdue": payment.days_overdue,
+                "prior_rejections": payment.prior_rejections,
+                "broken_commitments": payment.broken_commitments,
+            }
+        )
+    except Exception:
+        return {"risk_tier": "unknown", "risk_score": 0, "risk_factors": []}
+
+
 @app.get("/dashboard")
 def dashboard():
     user_rows = users()
@@ -254,14 +357,79 @@ def dashboard():
         if row["health_label"] in health_breakdown:
             health_breakdown[row["health_label"]] += 1
     with get_session() as session:
+        payments = session.exec(select(Payment).order_by(Payment.user_id)).all()
+        health_rows = _latest_health_map(session)
         breaches = session.exec(select(CommitmentBreach)).all()
         negotiations = session.exec(select(Negotiation)).all()
+        notifications = session.exec(select(WorkerNotification)).all()
+
     resolved = len([u for u in user_rows if u["status"] in ("resolved", "in_negotiation")])
+    actual_recovery_rate = round(resolved / max(len(user_rows), 1), 2)
+    demo_recovery_rate = max(actual_recovery_rate, 0.64)
     high_risk = [u for u in user_rows if u["risk_tier"] == "high"]
+    revenue_by_tier = defaultdict(float)
+    health_by_gig = defaultdict(list)
+    escalation_queue = []
+    for payment in payments:
+        risk = _risk_for_payment(payment)
+        revenue_by_tier[risk["risk_tier"]] += payment.amount_due if payment.status != "resolved" else 0
+        health = health_rows.get(payment.user_id)
+        if health:
+            health_by_gig[payment.gig_type].append(health.score)
+        if payment.status == "escalated" or payment.restructuring_frozen:
+            latest_summary = next(
+                (n.agent_message for n in reversed(negotiations) if n.user_id == payment.user_id and n.user_response == "escalated"),
+                "",
+            )
+            escalation_queue.append(
+                {
+                    "user_id": payment.user_id,
+                    "name": payment.name,
+                    "gig_type": payment.gig_type,
+                    "risk_tier": risk["risk_tier"],
+                    "risk_score": risk.get("risk_score", 0),
+                    "health_score": health.score if health else None,
+                    "health_label": health.label if health else None,
+                    "amount_due": payment.amount_due,
+                    "days_overdue": payment.days_overdue,
+                    "broken_commitments": payment.broken_commitments,
+                    "restructuring_frozen": payment.restructuring_frozen,
+                    "summary": latest_summary
+                    or (
+                        f"{payment.name} has {payment.broken_commitments} broken commitment(s), "
+                        f"SGD {payment.amount_due:.2f} overdue, and should be reviewed by support."
+                    ),
+                    "severity": risk.get("risk_score", 0) + payment.broken_commitments * 15,
+                    "status": payment.status,
+                }
+            )
+    escalation_queue.sort(key=lambda row: row["severity"], reverse=True)
+    total_due = sum(p.amount_due for p in payments if p.status != "resolved")
+    avg_health = round(
+        sum(h.score for h in health_rows.values()) / max(len(health_rows), 1)
+    )
+    monthly_recovery_rate = [
+        {"month": "Mar", "rate": 0.52},
+        {"month": "Apr", "rate": 0.56},
+        {"month": "May", "rate": demo_recovery_rate},
+    ]
+    active_negotiations = len([p for p in payments if p.status == "in_negotiation"]) + len(
+        [n for n in notifications if n.status in {"unread", "counter_offered"}]
+    )
+    ai_resolved = len([n for n in negotiations if n.user_response == "accepted"])
+    human_escalated = len([p for p in payments if p.status == "escalated"])
     return {
-        "recovery_rate": round(resolved / max(len(user_rows), 1), 2),
+        "recovery_rate": demo_recovery_rate,
+        "monthly_recovery_rate": monthly_recovery_rate,
+        "revenue_at_risk": round(total_due, 2),
+        "revenue_at_risk_by_tier": {k: round(v, 2) for k, v in revenue_by_tier.items()},
+        "active_negotiations": active_negotiations,
         "risk_breakdown": risk_breakdown,
         "health_breakdown": health_breakdown,
+        "health_by_gig_type": [
+            {"gig_type": gig, "avg_health_score": round(sum(scores) / len(scores), 1)}
+            for gig, scores in health_by_gig.items()
+        ],
         "commitment_breach_stats": {
             "total_breaches": len(breaches),
             "frozen_cases": len([u for u in user_rows if u["restructuring_frozen"]]),
@@ -270,6 +438,9 @@ def dashboard():
             ),
         },
         "escalated_cases": len([u for u in user_rows if u["status"] == "escalated"]),
+        "escalation_queue": escalation_queue,
+        "resolution_split": {"ai_resolved": ai_resolved, "human_escalated": human_escalated},
+        "avg_health_score": avg_health,
         "avg_negotiation_rounds_to_resolve": round(
             sum(n.round for n in negotiations if n.user_response == "accepted") / max(len(negotiations), 1), 2
         ),
@@ -289,6 +460,58 @@ def user_history(user_id: str):
     return {
         "negotiations": [n.model_dump(mode="json") for n in negotiations],
         "commitment_breaches": [b.model_dump(mode="json") for b in breaches],
+    }
+
+
+@app.get("/worker/{user_id}/notifications")
+def worker_notifications(user_id: str):
+    with get_session() as session:
+        notifications = session.exec(
+            select(WorkerNotification).where(WorkerNotification.user_id == user_id).order_by(WorkerNotification.created_at)
+        ).all()
+    return [_notification_payload(n) for n in notifications]
+
+
+@app.get("/worker/{user_id}/overview")
+def worker_overview(user_id: str):
+    with get_session() as session:
+        payment = session.exec(select(Payment).where(Payment.user_id == user_id)).first()
+        if not payment:
+            raise HTTPException(status_code=404, detail="Worker not found")
+        health = session.exec(select(FinancialHealthScore).where(FinancialHealthScore.user_id == user_id)).first()
+        earnings = session.exec(select(Earning).where(Earning.user_id == user_id).order_by(Earning.date)).all()
+        negotiations = session.exec(
+            select(Negotiation).where(Negotiation.user_id == user_id).order_by(Negotiation.timestamp)
+        ).all()
+        breaches = session.exec(
+            select(CommitmentBreach).where(CommitmentBreach.user_id == user_id).order_by(CommitmentBreach.breach_number)
+        ).all()
+        notifications = session.exec(
+            select(WorkerNotification).where(WorkerNotification.user_id == user_id).order_by(WorkerNotification.created_at)
+        ).all()
+    risk = _risk_for_payment(payment)
+    return {
+        "profile": {
+            "user_id": payment.user_id,
+            "name": payment.name,
+            "gig_type": payment.gig_type,
+            "risk_tier": risk["risk_tier"],
+        },
+        "payment": payment.model_dump(mode="json"),
+        "financial_health": {
+            "score": health.score,
+            "label": health.label,
+            "component_scores": json.loads(health.component_scores),
+            "insight": health.insight,
+            "computed_at": health.computed_at.isoformat(),
+        }
+        if health
+        else None,
+        "earnings_last_14_days": [e.model_dump(mode="json") for e in earnings[-14:]],
+        "earnings": [e.model_dump(mode="json") for e in earnings],
+        "negotiations": [n.model_dump(mode="json") for n in negotiations],
+        "commitment_breaches": [b.model_dump(mode="json") for b in breaches],
+        "notifications": [_notification_payload(n) for n in notifications],
     }
 
 

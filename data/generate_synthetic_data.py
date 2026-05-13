@@ -22,6 +22,7 @@ from db.database import (
     FinancialHealthScore,
     Negotiation,
     Payment,
+    WorkerNotification,
     create_db_and_tables,
     engine,
 )
@@ -93,7 +94,7 @@ def seed_database() -> None:
     create_db_and_tables()
     today = datetime.now(SGT).date()
     with Session(engine) as session:
-        for table in [CommitmentBreach, Negotiation, FinancialHealthScore, Earning, Payment]:
+        for table in [WorkerNotification, CommitmentBreach, Negotiation, FinancialHealthScore, Earning, Payment]:
             session.exec(delete(table))
         session.commit()
 

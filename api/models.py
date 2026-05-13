@@ -17,6 +17,15 @@ class MarkPaymentMissedRequest(BaseModel):
     negotiation_id: int
 
 
+class SendNotificationRequest(BaseModel):
+    user_id: str
+
+
+class WorkerNotificationResponseRequest(BaseModel):
+    notification_id: int
+    user_response: Literal["accepted", "rejected", "support_requested"]
+
+
 class AgentResponse(BaseModel):
     state_id: Optional[str] = None
     agent_message: Optional[str] = None

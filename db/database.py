@@ -91,6 +91,21 @@ class AgentSession(SQLModel, table=True):
     updated_at: DateTime = Field(default_factory=DateTime.utcnow)
 
 
+class WorkerNotification(SQLModel, table=True):
+    __tablename__ = "worker_notifications"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    user_id: str = Field(index=True)
+    payment_id: int = Field(index=True)
+    state_id: str = Field(index=True)
+    message: str
+    repayment_plan: str = "{}"
+    status: str = "unread"
+    escalation_summary: Optional[str] = None
+    created_at: DateTime = Field(default_factory=DateTime.utcnow)
+    updated_at: DateTime = Field(default_factory=DateTime.utcnow)
+
+
 def create_db_and_tables() -> None:
     SQLModel.metadata.create_all(engine)
 
