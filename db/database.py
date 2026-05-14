@@ -106,6 +106,7 @@ class WorkerNotification(SQLModel, table=True):
     updated_at: DateTime = Field(default_factory=DateTime.utcnow)
 
 
+
 def create_db_and_tables() -> None:
     SQLModel.metadata.create_all(engine)
 

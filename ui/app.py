@@ -1,4 +1,5 @@
 import os
+import re
 from datetime import datetime
 from html import escape
 
@@ -44,7 +45,7 @@ st.markdown(
     .badge-hardship {background:#f1eadf;color:#574d42;}
     .badge-status {background:#e4f1ff;color:#0f4d86;}
     .badge-escalated {background:#ffe6e6;color:#8b2424;}
-    .badge-frozen {background:#ffe5e5;color:#8b2424;border:1px solid #ffb8b8;}
+    .badge-frozen {background:#eef0ff;color:#4b4e9e;border:1px solid #c8ccff;}
     .health-track {height:7px;background:#333;border-radius:999px;overflow:hidden;display:inline-block;width:64px;margin-right:10px;}
     .health-fill {height:7px;border-radius:999px;}
     .quote {border-left:2px solid #777;padding-left:12px;color:#d1cdc5;font-weight:700;line-height:1.45;}
@@ -64,6 +65,20 @@ st.markdown(
     .earn-bar {border-radius:4px 4px 0 0;background:#9ddcc8;min-height:4px;}
     .earn-bar.peak {background:#5d9f1e;}
     .timeline-card {padding:14px;margin:10px 0;display:grid;grid-template-columns:36px 1fr;gap:12px;}
+    .escalation-section-title {
+        color:#bdb9b1;font-size:.88rem;font-weight:900;letter-spacing:.02em;margin:6px 0 10px;
+    }
+    .escalation-card {padding:16px;margin-bottom:12px;}
+    .escalation-topline {
+        display:flex;justify-content:space-between;align-items:flex-start;gap:12px;margin-bottom:10px;
+    }
+    .escalation-meta {color:#c7c3bc;font-weight:800;margin-top:8px;line-height:1.45;}
+    .escalation-summary {border-left:2px solid #555;padding-left:12px;color:#d1cdc5;font-weight:700;line-height:1.45;margin:12px 0 14px;}
+    .modal-grid {display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:10px 0 14px;}
+    .modal-stat {background:#282827;border:1px solid #3f3f3d;border-radius:8px;padding:12px;}
+    .modal-stat-label {color:#bdb9b1;font-size:.85rem;font-weight:800;}
+    .modal-stat-value {color:#fff;font-size:1.15rem;font-weight:900;line-height:1.2;}
+    .modal-note {background:#282827;border:1px solid #3f3f3d;border-radius:8px;padding:14px;color:#e0ddd6;font-weight:700;line-height:1.5;}
     div[data-testid="stButton"] button {border-radius:8px;font-weight:800;}
     div[data-testid="stDataFrame"] {border:1px solid #3f3f3d;border-radius:8px;}
     </style>
@@ -111,6 +126,17 @@ def fmt_date(value: str) -> str:
         return datetime.fromisoformat(value.replace("Z", "")).strftime("%d %b %Y")
     except Exception:
         return value
+
+
+def plain_text(value: str) -> str:
+    if not value:
+        return ""
+    text = str(value)
+    text = text.replace("\r", " ").replace("\n", " ")
+    text = text.replace("<br>", " ").replace("<br/>", " ").replace("<br />", " ")
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
 
 
 def refresh_admin():
@@ -197,7 +223,7 @@ def render_worker_table(users: list[dict]):
         status = str(user.get("status") or "").replace("_", " ").title()
         status_class = "badge-escalated" if status.lower() == "escalated" else "badge-status"
         breach = user.get("broken_commitments") or 0
-        breach_text = f" · {breach} breach{'es' if breach != 1 else ''}" if breach else ""
+        breach_text = f" | {breach} breach{'es' if breach != 1 else ''}" if breach else ""
         st.markdown(
             f"""
             <div class="worker-row">
@@ -215,31 +241,171 @@ def render_worker_table(users: list[dict]):
     st.markdown("</div>", unsafe_allow_html=True)
 
 
+def render_escalation_detail(user_id: str, source: str | None = None):
+    overview = api("GET", f"/worker/{user_id}/overview")
+    profile = overview["profile"]
+    payment = overview["payment"]
+    financial_health = overview.get("financial_health") or {}
+    negotiations = overview.get("negotiations") or []
+    breaches = overview.get("commitment_breaches") or []
+    notifications = overview["notifications"]
+    latest_notification = notifications[-1] if notifications else None
+    escalation_record = next((n for n in reversed(negotiations) if n.get("user_response") == "escalated"), None)
+
+    origin = "Agent auto-escalation"
+    reason = "Repeated broken commitments and overdue balance triggered a support review."
+    if source == "worker":
+        origin = "Worker requested support"
+        reason = (latest_notification or {}).get("escalation_summary") or "Worker asked for additional help through the agent."
+    elif escalation_record and escalation_record.get("agent_message"):
+        reason = escalation_record.get("agent_message")
+    elif latest_notification and latest_notification.get("escalation_summary"):
+        reason = latest_notification.get("escalation_summary")
+    elif payment.get("restructuring_frozen"):
+        reason = "Autonomous restructuring was frozen after repeated broken commitments."
+
+    st.markdown(
+        f"""
+        <div style="margin-bottom:12px;">
+          <div style="font-size:2rem;font-weight:900;color:#fff;line-height:1.1;">{escape(profile['name'])}</div>
+          <div class="metric-subtle" style="margin-top:4px;">
+            {escape(profile['user_id'])} | {escape(profile['gig_type'].replace('_', '-').title())} | {escape(str(profile['risk_tier']).title())} risk
+          </div>
+          <div class="metric-subtle" style="margin-top:4px;">{escape(origin)}</div>
+        </div>
+        <div class="metric-label">CASE OVERVIEW</div>
+        <div class="modal-grid">
+          <div class="modal-stat">
+            <div class="modal-stat-label">Origin of escalation</div>
+            <div class="modal-stat-value">{escape(origin)}</div>
+          </div>
+          <div class="modal-stat">
+            <div class="modal-stat-label">Amount overdue</div>
+            <div class="modal-stat-value">{money(payment['amount_due'])}</div>
+          </div>
+          <div class="modal-stat">
+            <div class="modal-stat-label">Days overdue</div>
+            <div class="modal-stat-value">{int(payment['days_overdue'])}</div>
+          </div>
+          <div class="modal-stat">
+            <div class="modal-stat-label">Health score</div>
+            <div class="modal-stat-value">{int(financial_health.get('score') or 0)}/100</div>
+          </div>
+          <div class="modal-stat">
+            <div class="modal-stat-label">Broken commitments</div>
+            <div class="modal-stat-value">{int(payment['broken_commitments'])}</div>
+          </div>
+        </div>
+        <div class="metric-label">CASE SUMMARY</div>
+        <div class="modal-note">{escape(plain_text(reason))}</div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    history_rows = [
+        {
+            "Date": fmt_date(str(item.get("timestamp", ""))),
+            "Round": item.get("round"),
+            "Response": str(item.get("user_response", "")).replace("_", " ").title(),
+            "Agent message": plain_text(item.get("agent_message") or ""),
+        }
+        for item in negotiations
+    ]
+    breach_rows = [
+        {
+            "Breach #": item.get("breach_number"),
+            "Due date": fmt_date(str(item.get("installment_due_date", ""))),
+            "Amount": money(float(item.get("installment_amount") or 0)),
+            "Detected": fmt_date(str(item.get("breach_detected_at", ""))),
+        }
+        for item in breaches
+    ]
+    comm_rows = [
+        {
+            "Date": fmt_date(str(item.get("created_at", ""))),
+            "Status": str(item.get("status", "")).replace("_", " ").title(),
+            "Message": plain_text(item.get("message") or ""),
+        }
+        for item in notifications
+    ]
+
+    st.markdown('<div class="metric-label" style="margin-top:16px;">BREACH HISTORY</div>', unsafe_allow_html=True)
+    if breach_rows:
+        st.dataframe(pd.DataFrame(breach_rows), use_container_width=True, hide_index=True)
+    else:
+        st.caption("No commitment breaches recorded.")
+
+    st.markdown('<div class="metric-label" style="margin-top:16px;">CASE HISTORY</div>', unsafe_allow_html=True)
+    if history_rows:
+        st.dataframe(pd.DataFrame(history_rows), use_container_width=True, hide_index=True)
+    else:
+        st.caption("No negotiation history recorded.")
+
+    st.markdown('<div class="metric-label" style="margin-top:16px;">AGENT COMM RECORD</div>', unsafe_allow_html=True)
+    if comm_rows:
+        st.dataframe(pd.DataFrame(comm_rows), use_container_width=True, hide_index=True)
+    else:
+        st.caption("No agent communication record available.")
+
+
+@st.dialog("Case details", width="large")
+def render_escalation_dialog(user_id: str, source: str | None = None):
+    render_escalation_detail(user_id, source)
+
+
 def render_escalations(dashboard: dict):
     queue = dashboard.get("escalation_queue") or []
     if not queue:
         st.info("No escalated cases in queue.")
         return
-    for case in queue:
-        frozen = '<span class="badge badge-frozen">Frozen</span>' if case.get("restructuring_frozen") else ""
+
+    agent_cases = [case for case in queue if case.get("escalation_source") != "worker"]
+    worker_cases = [case for case in queue if case.get("escalation_source") == "worker"]
+
+    def render_case_column(title: str, cases: list[dict], key_prefix: str):
         st.markdown(
-            f"""
-            <div class="panel">
-              <div style="display:flex;justify-content:space-between;gap:12px;">
-                <div>
-                  <b style="font-size:1.05rem;">{escape(case['name'])}</b>
-                  <span class="badge {risk_class(case['risk_tier'])}">{escape(str(case['risk_tier']).title())}</span>
-                  <span class="badge badge-medium">{int(case['broken_commitments'])} breaches</span>
-                  {frozen}
-                  <div class="metric-subtle">{escape(case['user_id'])} · {money(case['amount_due'])} · {int(case['days_overdue'])} days overdue · {escape(case['gig_type'].replace('_','-').title())}</div>
-                </div>
-                <span class="badge badge-escalated">Escalated</span>
-              </div>
-              <div class="quote">{escape(case['summary'])}</div>
-            </div>
-            """,
+            f'<div class="escalation-section-title">{escape(title.upper())} {len(cases)}</div>',
             unsafe_allow_html=True,
         )
+        if not cases:
+            st.info("No cases in this list.")
+            return
+        for case in cases:
+            frozen = '<span class="badge badge-frozen">Frozen</span>' if case.get("restructuring_frozen") else ""
+            st.markdown(
+                f"""
+                <div class="panel escalation-card">
+                  <div class="escalation-topline">
+                    <div>
+                      <b style="font-size:1.15rem;color:#fff;">{escape(case['name'])}</b><br>
+                      <span class="badge {risk_class(case['risk_tier'])}">{escape(str(case['risk_tier']).title())}</span>
+                      <span class="badge badge-medium">{int(case['broken_commitments'])} breaches</span>
+                      {frozen}
+                    </div>
+                    <span class="badge badge-escalated">Escalated</span>
+                  </div>
+                  <div class="escalation-meta">
+                    {escape(case['user_id'])} | {money(case['amount_due'])} | {int(case['days_overdue'])} days overdue | {escape(case['gig_type'].replace('_', '-').title())}
+                  </div>
+                  <div class="escalation-summary">{escape(plain_text(case['summary']))}</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+            if st.button(f"Review {case['user_id']}", use_container_width=True, key=f"{key_prefix}_{case['user_id']}"):
+                st.session_state["escalation_detail_user"] = case["user_id"]
+                st.session_state["escalation_detail_source"] = case.get("escalation_source", "agent")
+                st.rerun()
+
+    left, right = st.columns(2)
+    with left:
+        render_case_column("Escalated by agent", agent_cases, "agent_review")
+    with right:
+        render_case_column("Escalated by worker", worker_cases, "worker_review")
+
+    selected = st.session_state.get("escalation_detail_user")
+    if selected:
+        render_escalation_dialog(selected, st.session_state.get("escalation_detail_source"))
 
 
 def render_trigger_agent(users: list[dict]):
@@ -253,7 +419,7 @@ def render_trigger_agent(users: list[dict]):
     }
     c1, c2 = st.columns([4, 1.1])
     selected = c1.selectbox("Worker", labels.keys(), label_visibility="collapsed")
-    if c2.button("Trigger agent", type="primary", use_container_width=True):
+    if c2.button("Trigger agent", type="primary", use_container_width=True, key="trigger_agent_btn"):
         result = api("POST", "/notifications/send", json={"user_id": labels[selected]})
         st.session_state["last_trigger"] = result
         refresh_admin()
@@ -263,8 +429,8 @@ def render_trigger_agent(users: list[dict]):
         st.markdown(
             f"""
             <div class="panel">
-              <b>Last triggered:</b> {escape(notification['user_id'])} ·
-              {fmt_date(notification['created_at'])} · Status: notification delivered
+              <b>Last triggered:</b> {escape(notification['user_id'])} |
+              {fmt_date(notification['created_at'])} | Status: notification delivered
             </div>
             """,
             unsafe_allow_html=True,
@@ -303,7 +469,7 @@ def render_admin():
 
 def notification_actions(notification: dict):
     status = notification.get("status")
-    if status in {"accepted", "escalated"}:
+    if status in {"accepted", "escalated", "worker_escalated"}:
         st.caption(f"Notification status: {status.replace('_', ' ').title()}")
         return
     c1, c2, c3 = st.columns([1, 1.55, 1.15])
@@ -373,8 +539,8 @@ def render_health_card(health: dict):
     {''.join(rows)}
 </div>
 """,
-unsafe_allow_html=True,
-)
+        unsafe_allow_html=True,
+    )
 
 
 def render_earnings_chart(earnings: list[dict]):
@@ -412,7 +578,7 @@ def render_worker_history(overview: dict):
                 f"""
                 <div class="timeline-card">
                   <div class="avatar" style="height:32px;width:32px;">G</div>
-                  <div><b>{fmt_date(n['created_at'])} · Agent message</b><br>{escape(n.get('message') or '')}</div>
+                  <div><b>{fmt_date(n['created_at'])} | Agent message</b><br>{escape(n.get('message') or '')}</div>
                 </div>
                 """,
                 unsafe_allow_html=True,
@@ -443,7 +609,7 @@ def render_worker():
         f"""
         <div class="profile-head">
           <div class="avatar">{escape(initials)}</div>
-          <div><b style="font-size:1.25rem;">{escape(profile['name'])}</b><br><span class="metric-subtle">{escape(profile['user_id'])} · {escape(profile['gig_type'].replace('_','-').title())}</span></div>
+          <div><b style="font-size:1.25rem;">{escape(profile['name'])}</b><br><span class="metric-subtle">{escape(profile['user_id'])} | {escape(profile['gig_type'].replace('_', '-').title())}</span></div>
           <div style="margin-left:auto;"><span class="badge {risk_class(profile['risk_tier'])}">{escape(str(profile['risk_tier']).title())} risk</span></div>
         </div>
         """,
@@ -464,7 +630,7 @@ def render_worker():
                   <div class="metric-value">{sgd(payment['amount_due'])} <span class="metric-warn" style="font-size:1rem;">overdue</span></div>
                   <div class="plan-line"><div>Due date</div><div></div><div>{fmt_date(payment['due_date'])}</div></div>
                   <div class="plan-line"><div>Days overdue</div><div></div><div>{int(payment['days_overdue'])} days</div></div>
-                  <div class="plan-line"><div>Plan status</div><div></div><div>{escape(str(latest_notification.get('status','No offer') if latest_notification else 'No offer').replace('_',' ').title())}</div></div>
+                  <div class="plan-line"><div>Plan status</div><div></div><div>{escape(str(latest_notification.get('status', 'No offer') if latest_notification else 'No offer').replace('_', ' ').title())}</div></div>
                 </div>
                 """,
                 unsafe_allow_html=True,
