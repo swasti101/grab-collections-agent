@@ -230,7 +230,7 @@ def worker_notification_response(req: WorkerNotificationResponseRequest):
             notification.status = {
                 "accepted": "accepted",
                 "rejected": "counter_offered",
-                "support_requested": "escalated",
+                "support_requested": "worker_escalated",
             }[req.user_response]
             notification.updated_at = datetime.utcnow()
             if response.plan:
@@ -346,6 +346,19 @@ def _risk_for_payment(payment: Payment) -> dict:
         return {"risk_tier": "unknown", "risk_score": 0, "risk_factors": []}
 
 
+def _escalation_source_for_user(user_id: str, notifications: list[WorkerNotification]) -> str:
+    if any(n.user_id == user_id and n.status == "worker_escalated" for n in notifications):
+        return "worker"
+    user_escalations = [n for n in notifications if n.user_id == user_id and n.status == "escalated"]
+    for notification in user_escalations:
+        created_at = notification.created_at
+        updated_at = notification.updated_at
+        if isinstance(created_at, datetime) and isinstance(updated_at, datetime):
+            if (updated_at - created_at).total_seconds() > 5:
+                return "worker"
+    return "agent"
+
+
 @app.get("/dashboard")
 def dashboard():
     user_rows = users()
@@ -377,6 +390,7 @@ def dashboard():
         if health:
             health_by_gig[payment.gig_type].append(health.score)
         if payment.status == "escalated" or payment.restructuring_frozen:
+            escalation_source = _escalation_source_for_user(payment.user_id, notifications)
             latest_summary = next(
                 (n.agent_message for n in reversed(negotiations) if n.user_id == payment.user_id and n.user_response == "escalated"),
                 "",
@@ -394,6 +408,7 @@ def dashboard():
                     "days_overdue": payment.days_overdue,
                     "broken_commitments": payment.broken_commitments,
                     "restructuring_frozen": payment.restructuring_frozen,
+                    "escalation_source": escalation_source,
                     "summary": latest_summary
                     or (
                         f"{payment.name} has {payment.broken_commitments} broken commitment(s), "
