@@ -253,7 +253,7 @@ def render_trigger_agent(users: list[dict]):
     }
     c1, c2 = st.columns([4, 1.1])
     selected = c1.selectbox("Worker", labels.keys(), label_visibility="collapsed")
-    if c2.button("Trigger agent", type="primary", use_container_width=True):
+    if c2.button("Trigger agent", type="primary", use_container_width=True, key="trigger_agent_btn"):
         result = api("POST", "/notifications/send", json={"user_id": labels[selected]})
         st.session_state["last_trigger"] = result
         refresh_admin()
