@@ -28,6 +28,12 @@ def should_continue(state: AgentState) -> str:
     return "generate_plan"
 
 
+def route_after_plan(state: AgentState) -> str:
+    if state["status"] == "escalated":
+        return "escalate"
+    return "draft_message"
+
+
 def build_graph():
     graph = StateGraph(AgentState)
     graph.add_node("fetch_and_analyze", node_fetch_and_analyze)
@@ -46,7 +52,11 @@ def build_graph():
         {"escalate": "escalate", "classify_risk": "classify_risk"},
     )
     graph.add_edge("classify_risk", "generate_plan")
-    graph.add_edge("generate_plan", "draft_message")
+    graph.add_conditional_edges(
+        "generate_plan",
+        route_after_plan,
+        {"escalate": "escalate", "draft_message": "draft_message"},
+    )
     graph.add_edge("draft_message", END)
     graph.add_conditional_edges(
         "handle_response",

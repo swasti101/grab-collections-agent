@@ -488,6 +488,12 @@ def render_notification(notification: dict | None):
     if not notification:
         st.markdown('<div class="notification"><b>No active message from Grab</b><br>You have no repayment notification right now.</div>', unsafe_allow_html=True)
         return
+    message = notification.get("message") or ""
+    if not plain_text(message):
+        message = (
+            notification.get("escalation_summary")
+            or "Your case is being reviewed by our support team, who will contact you shortly."
+        )
     plan = notification.get("repayment_plan") or {}
     lines = []
     for idx, item in enumerate(plan.get("installments") or [], start=1):
@@ -503,7 +509,7 @@ def render_notification(notification: dict | None):
         f"""
         <div class="notification">
           <b>New message from Grab</b><br>
-          {escape(notification.get('message') or '')}
+          {escape(message)}
           {plan_html}
         </div>
         """,
