@@ -75,6 +75,7 @@ def _state_from_payment(payment: Payment) -> AgentState:
         "recommended_tone": None,
         "can_self_serve": None,
         "repayment_plan": None,
+        "prior_plan": None,
         "nudge_scheduled_at": None,
         "agent_message": None,
         "negotiation_round": payment.prior_rejections,

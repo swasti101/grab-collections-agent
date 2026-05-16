@@ -1,4 +1,5 @@
 import json
+import math
 import os
 from datetime import date, datetime, timedelta
 
@@ -13,6 +14,9 @@ from db.database import Earning, Payment, get_session
 
 FREEZE_THRESHOLD = int(os.getenv("COMMITMENT_FREEZE_THRESHOLD", "2"))
 SGT = pytz.timezone("Asia/Singapore")
+SMALL_BALANCE_THRESHOLD = 80.0
+TARGET_INSTALLMENT_SIZE = 75.0
+MAX_INSTALLMENTS = 6
 
 
 def _tool_result(result):
@@ -34,6 +38,7 @@ def _earnings_summary(user_id: str, days: int = 30) -> dict:
     avg_daily = float(recent["amount"].mean())
     day_means = recent.groupby("weekday")["amount"].mean().sort_values(ascending=False)
     peak_days = day_means.head(2).index.tolist()
+    weekday_averages = {day: round(float(amount), 2) for day, amount in day_means.items()}
     peak_hour = int(round(recent["hour_of_peak"].mode().iloc[0]))
     nudge_hour = max(8, min(22, peak_hour + 2))
     recent_avg = float(recent.tail(14)["amount"].mean())
@@ -56,6 +61,7 @@ def _earnings_summary(user_id: str, days: int = 30) -> dict:
     return {
         "avg_daily_income": round(avg_daily, 2),
         "peak_days": peak_days,
+        "weekday_averages": weekday_averages,
         "peak_hour": peak_hour,
         "nudge_hour": nudge_hour,
         "income_trend": trend,
@@ -168,6 +174,122 @@ def _next_date_for_day(day_name: str, offset_days: int = 0) -> date:
     return today + timedelta(days=delta or 7)
 
 
+def _next_date_on_or_after(day_name: str, start_date: date) -> date:
+    weekdays = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+    target = weekdays.index(day_name)
+    delta = (target - start_date.weekday()) % 7
+    return start_date + timedelta(days=delta)
+
+
+def _build_peak_day_sequence(peak_days: list[str], count: int) -> list[str]:
+    days = peak_days or ["Friday"]
+    return [days[idx % len(days)] for idx in range(count)]
+
+
+def _weighted_installment_amounts(amount_due: float, day_sequence: list[str], weekday_averages: dict) -> list[float]:
+    if not day_sequence:
+        return [round(amount_due, 2)]
+
+    strengths = [max(float(weekday_averages.get(day, 0.0)), 1.0) for day in day_sequence]
+    total_strength = sum(strengths)
+    raw_cents = [(amount_due * 100) * (strength / total_strength) for strength in strengths]
+    floor_cents = [int(value) for value in raw_cents]
+    remainder = int(round(amount_due * 100)) - sum(floor_cents)
+
+    ranked = sorted(
+        enumerate(raw_cents),
+        key=lambda item: item[1] - floor_cents[item[0]],
+        reverse=True,
+    )
+    for idx, _ in ranked[:remainder]:
+        floor_cents[idx] += 1
+
+    return [round(cents / 100, 2) for cents in floor_cents]
+
+
+def _peak_aligned_installments(
+    amount_due: float,
+    count: int,
+    peak_days: list[str],
+    weekday_averages: dict,
+    initial_offset_days: int = 0,
+) -> list[dict]:
+    day_sequence = _build_peak_day_sequence(peak_days, count)
+    amounts = _weighted_installment_amounts(amount_due, day_sequence, weekday_averages)
+    installments = []
+
+    first_due = _next_date_for_day(day_sequence[0], initial_offset_days)
+    installments.append({"due_date": first_due.isoformat(), "amount": amounts[0]})
+
+    previous_due = first_due
+    for idx in range(1, count):
+        # Keep offers on strong earning days while avoiding back-to-back dates.
+        search_start = previous_due + timedelta(days=6)
+        due = _next_date_on_or_after(day_sequence[idx], search_start)
+        installments.append({"due_date": due.isoformat(), "amount": amounts[idx]})
+        previous_due = due
+
+    return installments
+
+
+def _installment_count_for_amount(amount_due: float) -> int:
+    if amount_due <= SMALL_BALANCE_THRESHOLD:
+        return 1
+    return max(2, min(MAX_INSTALLMENTS, int(math.ceil(amount_due / TARGET_INSTALLMENT_SIZE))))
+
+
+def _postpone_days_for_small_amount(amount_due: float) -> int:
+    if amount_due <= 40:
+        return 5
+    if amount_due <= 60:
+        return 4
+    return 3
+
+
+def _counter_offer_from_existing_plan(
+    amount_due: float,
+    current_plan: dict,
+    peak_days: list[str],
+    weekday_averages: dict,
+) -> dict | None:
+    installments = current_plan.get("installments") or []
+    if not installments:
+        return None
+
+    current_count = len(installments)
+    if current_count == 1 and amount_due <= SMALL_BALANCE_THRESHOLD:
+        current_due = installments[0].get("due_date")
+        try:
+            base_date = datetime.fromisoformat(str(current_due)).date()
+        except Exception:
+            base_date = datetime.now(SGT).date()
+        postpone_days = _postpone_days_for_small_amount(amount_due)
+        due_date = base_date + timedelta(days=postpone_days)
+        return {
+            "plan_type": "deferred_single",
+            "installments": [{"due_date": due_date.isoformat(), "amount": round(amount_due, 2)}],
+            "total_amount": round(amount_due, 2),
+            "peak_day_aligned": False,
+            "summary": f"Single payment deferred by {postpone_days} more days to {due_date.isoformat()}.",
+        }
+
+    next_count = min(current_count + 1, MAX_INSTALLMENTS)
+    installments = _peak_aligned_installments(
+        amount_due=amount_due,
+        count=next_count,
+        peak_days=peak_days,
+        weekday_averages=weekday_averages,
+        initial_offset_days=7,
+    )
+    return {
+        "plan_type": "installments",
+        "installments": installments,
+        "total_amount": round(amount_due, 2),
+        "peak_day_aligned": True,
+        "summary": f"Counter-offer with {next_count} payment(s) aligned to expected peak earning days.",
+    }
+
+
 @tool
 def generate_repayment_plan(
     user_id: str,
@@ -176,6 +298,7 @@ def generate_repayment_plan(
     risk_tier: str,
     negotiation_round: int,
     broken_commitments: int,
+    current_plan: dict | None = None,
 ) -> dict:
     """Generate an income-aware repayment plan unless autonomous restructuring is frozen."""
     if broken_commitments >= FREEZE_THRESHOLD:
@@ -198,31 +321,67 @@ def generate_repayment_plan(
         }
 
     peak_days = earnings_summary.get("peak_days") or ["Friday"]
-    first_date = _next_date_for_day(peak_days[0], 7 if negotiation_round >= 2 else 0)
+    weekday_averages = earnings_summary.get("weekday_averages") or {}
+    if current_plan:
+        counter_offer = _counter_offer_from_existing_plan(
+            amount_due=amount_due,
+            current_plan=current_plan,
+            peak_days=peak_days,
+            weekday_averages=weekday_averages,
+        )
+        if counter_offer:
+            return counter_offer
+
     if risk_tier == "hardship":
-        pay_date = datetime.now(SGT).date() + timedelta(days=14)
-        installments = [{"due_date": pay_date.isoformat(), "amount": round(amount_due, 2)}]
+        grace_days = 14 if negotiation_round == 0 else 21 if negotiation_round == 1 else 28
+        pay_date = datetime.now(SGT).date() + timedelta(days=grace_days)
+        hardship_count = _installment_count_for_amount(amount_due)
+        installments = []
+        if hardship_count == 1:
+            installments = [{"due_date": pay_date.isoformat(), "amount": round(amount_due, 2)}]
+        else:
+            day_sequence = _build_peak_day_sequence(peak_days, hardship_count)
+            amounts = _weighted_installment_amounts(amount_due, day_sequence, weekday_averages)
+            current_due = pay_date
+            for idx, day_name in enumerate(day_sequence):
+                due_date = _next_date_on_or_after(day_name, current_due) if idx == 0 else _next_date_on_or_after(day_name, current_due + timedelta(days=6))
+                installments.append({"due_date": due_date.isoformat(), "amount": amounts[idx]})
+                current_due = due_date
         return {
-            "plan_type": "grace_period",
+            "plan_type": "grace_period" if hardship_count == 1 else "hardship_installments",
             "installments": installments,
             "total_amount": round(amount_due, 2),
-            "peak_day_aligned": False,
-            "summary": f"14-day pause, then SGD {amount_due:.2f} due on {pay_date.isoformat()}.",
+            "peak_day_aligned": hardship_count > 1,
+            "summary": (
+                f"{grace_days}-day pause, then {hardship_count} payment(s) starting on {installments[0]['due_date']}."
+            ),
         }
 
-    base_count = {"low": 1, "medium": 2, "high": 3}.get(risk_tier, 2)
-    count = base_count + (1 if negotiation_round >= 1 else 0)
-    amount = round(amount_due / count, 2)
-    installments = []
-    for idx in range(count):
-        due = first_date + timedelta(days=7 * idx)
-        installments.append({"due_date": due.isoformat(), "amount": amount if idx < count - 1 else round(amount_due - amount * (count - 1), 2)})
+    count = _installment_count_for_amount(amount_due)
+    if count == 1:
+        postpone_days = _postpone_days_for_small_amount(amount_due)
+        due_date = datetime.now(SGT).date() + timedelta(days=postpone_days)
+        return {
+            "plan_type": "deferred_single",
+            "installments": [{"due_date": due_date.isoformat(), "amount": round(amount_due, 2)}],
+            "total_amount": round(amount_due, 2),
+            "peak_day_aligned": False,
+            "summary": f"Single payment deferred by {postpone_days} days to {due_date.isoformat()}.",
+        }
+
+    installments = _peak_aligned_installments(
+        amount_due=amount_due,
+        count=count,
+        peak_days=peak_days,
+        weekday_averages=weekday_averages,
+        initial_offset_days=7 if negotiation_round >= 2 else 0,
+    )
     return {
-        "plan_type": "immediate" if count == 1 else "installments",
+        "plan_type": "installments",
         "installments": installments,
         "total_amount": round(amount_due, 2),
         "peak_day_aligned": True,
-        "summary": f"{count} payment(s) aligned to expected peak earning days.",
+        "summary": f"Counter-offer with {count} payment(s) aligned to expected peak earning days.",
     }
 
 

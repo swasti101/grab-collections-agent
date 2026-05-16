@@ -19,6 +19,7 @@ class AgentState(TypedDict):
     recommended_tone: Optional[str]
     can_self_serve: Optional[bool]
     repayment_plan: Optional[dict]
+    prior_plan: Optional[dict]
     nudge_scheduled_at: Optional[str]
     agent_message: Optional[str]
     negotiation_round: int

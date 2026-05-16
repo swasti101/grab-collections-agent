@@ -250,9 +250,11 @@ def node_generate_plan(state: AgentState) -> AgentState:
             "risk_tier": state["risk_tier"],
             "negotiation_round": state["negotiation_round"],
             "broken_commitments": state["broken_commitments"],
+            "current_plan": state.get("prior_plan"),
         }
     )
     state["repayment_plan"] = plan
+    state["prior_plan"] = None
     if plan["plan_type"] in {"frozen", "escalate"}:
         state["status"] = "escalated"
     else:
@@ -305,6 +307,7 @@ def node_handle_response(state: AgentState) -> AgentState:
     elif response == "rejected":
         offered_plan = state.get("repayment_plan") or {}
         state["negotiation_round"] += 1
+        state["prior_plan"] = offered_plan
         state["repayment_plan"] = None
         state["status"] = "negotiating"
         with get_session() as session:
