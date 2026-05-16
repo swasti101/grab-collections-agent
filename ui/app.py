@@ -9,6 +9,82 @@ import streamlit as st
 
 API_URL = os.getenv("API_URL", "http://localhost:8000")
 
+WORKER_LOCALES = {
+    "GW007": "ms",
+    "GW003": "hi",
+}
+
+LANGUAGE_OPTIONS = [
+    ("en", "English"),
+    ("ms", "Bahasa Melayu"),
+    ("hi", "Hindi"),
+    ("my", "Burmese"),
+    ("th", "Thai"),
+    ("zh", "Mandarin"),
+]
+
+I18N = {
+    "en": {
+        "no_active_title": "No active message from Grab",
+        "no_active_body": "You have no repayment notification right now.",
+        "new_message": "New message from Grab",
+        "plan_offered": "Repayment plan offered",
+        "installment": "Installment",
+        "accept_plan": "Accept plan",
+        "suggest_plan": "Suggest different plan",
+        "talk_support": "Talk to support",
+        "notification_status": "Notification status",
+        "worker_auth": "Worker authentication",
+        "language_pref": "Language preference",
+        "switch_role": "Switch role",
+        "overview": "Overview",
+        "earnings": "Earnings",
+        "history": "History",
+        "support_review": "Your case is being reviewed by our support team, who will contact you shortly.",
+        "agent_message": "Agent message",
+        "support_checkin": "Support check-in",
+    },
+    "ms": {
+        "no_active_title": "Tiada mesej aktif daripada Grab",
+        "no_active_body": "Anda tiada notifikasi bayaran balik buat masa ini.",
+        "new_message": "Mesej baharu daripada Grab",
+        "plan_offered": "Pelan bayaran balik ditawarkan",
+        "installment": "Ansuran",
+        "accept_plan": "Terima pelan",
+        "suggest_plan": "Cadangkan pelan lain",
+        "talk_support": "Hubungi sokongan",
+        "notification_status": "Status notifikasi",
+        "worker_auth": "Pengesahan pekerja",
+        "language_pref": "Pilihan bahasa",
+        "switch_role": "Tukar peranan",
+        "overview": "Gambaran keseluruhan",
+        "earnings": "Pendapatan",
+        "history": "Sejarah",
+        "support_review": "Kes anda sedang disemak oleh pasukan sokongan kami dan mereka akan menghubungi anda tidak lama lagi.",
+        "agent_message": "Mesej ejen",
+        "support_checkin": "Semakan sokongan",
+    },
+    "hi": {
+        "no_active_title": "Grab से कोई सक्रिय संदेश नहीं है",
+        "no_active_body": "अभी आपके पास कोई पुनर्भुगतान सूचना नहीं है।",
+        "new_message": "Grab का नया संदेश",
+        "plan_offered": "प्रस्तावित पुनर्भुगतान योजना",
+        "installment": "किस्त",
+        "accept_plan": "योजना स्वीकार करें",
+        "suggest_plan": "दूसरी योजना सुझाएं",
+        "talk_support": "सहायता से बात करें",
+        "notification_status": "सूचना की स्थिति",
+        "worker_auth": "वर्कर प्रमाणीकरण",
+        "switch_role": "भूमिका बदलें",
+        "overview": "ओवरव्यू",
+        "earnings": "कमाई",
+        "history": "इतिहास",
+        "support_review": "आपका मामला हमारी सहायता टीम देख रही है और वे जल्द ही आपसे संपर्क करेंगे।",
+        "agent_message": "एजेंट संदेश",
+        "support_checkin": "सहायता जाँच",
+    },
+}
+
 st.set_page_config(page_title="Grab Collections Agent", layout="wide")
 
 st.markdown(
@@ -157,6 +233,95 @@ def plain_text(value: str) -> str:
     text = re.sub(r"<[^>]+>", " ", text)
     text = re.sub(r"\s+", " ", text).strip()
     return text
+
+
+def worker_locale(user_id: str) -> str:
+    selected = st.session_state.get("worker_language_preferences", {}).get(user_id)
+    if selected:
+        return selected
+    return WORKER_LOCALES.get(user_id, "en")
+
+
+def t(user_id: str, key: str) -> str:
+    locale = worker_locale(user_id)
+    return I18N.get(locale, I18N["en"]).get(key, I18N["en"].get(key, key))
+
+
+def localized_collection_message(user_id: str, notification: dict, message: str) -> str:
+    locale = worker_locale(user_id)
+    if locale == "en":
+        return message
+
+    plan = notification.get("repayment_plan") or {}
+    installments = plan.get("installments") or []
+    total_amount = float(plan.get("total_amount") or 0)
+
+    if locale == "ms":
+        if installments:
+            plan_text = ", ".join(
+                f"SGD {float(item.get('amount', 0)):.2f} pada {fmt_date(str(item.get('due_date', '')))}"
+                for item in installments
+            )
+            return (
+                f"Hai {notification.get('user_id')}, baki tertunggak anda ialah SGD {total_amount:.2f}. "
+                f"Berdasarkan corak pendapatan anda, kami telah menyusun pelan ini mengikut hari pendapatan anda yang lebih kukuh. "
+                f"Cadangan pelan ialah {plan_text}. Sila sahkan jika pelan ini sesuai untuk anda."
+            )
+        return t(user_id, "support_review")
+
+    if locale == "hi":
+        if installments:
+            plan_text = ", ".join(
+                f"SGD {float(item.get('amount', 0)):.2f} दिनांक {fmt_date(str(item.get('due_date', '')))}"
+                for item in installments
+            )
+            return (
+                f"नमस्ते {notification.get('user_id')}, आपकी बकाया राशि SGD {total_amount:.2f} है। "
+                f"आपकी हाल की कमाई के पैटर्न के आधार पर हमने यह योजना आपके मजबूत कमाई वाले दिनों के अनुसार बनाई है। "
+                f"प्रस्तावित योजना है {plan_text}। कृपया बताएं कि क्या यह योजना आपके लिए ठीक है।"
+            )
+        return t(user_id, "support_review")
+
+    if locale == "my":
+        if installments:
+            plan_text = ", ".join(
+                f"SGD {float(item.get('amount', 0)):.2f} ကို {fmt_date(str(item.get('due_date', '')))} တွင်"
+                for item in installments
+            )
+            return (
+                f"မင်္ဂလာပါ {notification.get('user_id')}၊ သင်၏ကျန်ငွေပမာဏမှာ SGD {total_amount:.2f} ဖြစ်သည်။ "
+                f"သင်၏ဝင်ငွေပုံစံအရ ကျွန်ုပ်တို့သည် အားကောင်းသောဝင်ငွေရက်များနှင့်ကိုက်ညီအောင် ဤအစီအစဉ်ကိုပြုလုပ်ထားပါသည်။ "
+                f"အဆိုပြုအစီအစဉ်မှာ {plan_text} ဖြစ်ပါသည်။ ဤအစီအစဉ်က သင့်အတွက်အဆင်ပြေမပြေ အတည်ပြုပေးပါ။"
+            )
+        return "သင်၏ကိစ္စကို ကျွန်ုပ်တို့၏ပံ့ပိုးမှုအဖွဲ့က စစ်ဆေးနေပြီး မကြာမီ သင့်ကို ဆက်သွယ်ပါမည်။"
+
+    if locale == "th":
+        if installments:
+            plan_text = ", ".join(
+                f"SGD {float(item.get('amount', 0)):.2f} วันที่ {fmt_date(str(item.get('due_date', '')))}"
+                for item in installments
+            )
+            return (
+                f"สวัสดี {notification.get('user_id')} ยอดค้างชำระของคุณคือ SGD {total_amount:.2f} "
+                f"จากรูปแบบรายได้ล่าสุดของคุณ เราได้จัดแผนนี้ให้สอดคล้องกับวันที่คุณมีรายได้ดีกว่า "
+                f"แผนที่เสนอคือ {plan_text} กรุณายืนยันว่าแผนนี้เหมาะกับคุณหรือไม่"
+            )
+        return "ทีมสนับสนุนของเรากำลังตรวจสอบกรณีของคุณและจะติดต่อคุณในไม่ช้า"
+
+    if locale == "zh":
+        if installments:
+            plan_text = "，".join(
+                f"SGD {float(item.get('amount', 0)):.2f}，日期 {fmt_date(str(item.get('due_date', '')))}"
+                for item in installments
+            )
+            return (
+                f"您好 {notification.get('user_id')}，您的逾期金额为 SGD {total_amount:.2f}。"
+                f"根据您最近的收入模式，我们已按您较强的收入日期安排此计划。"
+                f"建议方案为 {plan_text}。请确认这是否适合您。"
+            )
+        return "您的个案正在由我们的客服团队审核，他们会尽快联系您。"
+
+    return message
 
 
 def payment_timing_text(payment: dict) -> tuple[str, str]:
@@ -592,12 +757,12 @@ def render_admin():
     st.markdown("</div>", unsafe_allow_html=True)
 
 
-def notification_actions(notification: dict):
+def notification_actions(notification: dict, user_id: str):
     status = notification.get("status")
     kind = notification_type(notification)
     if kind == "proactive_checkin":
         if status in {"proactive_acknowledged", "proactive_options_requested", "proactive_support_requested"}:
-            st.caption(f"Check-in status: {status.replace('proactive_', '').replace('_', ' ').title()}")
+            st.caption(f"{t(user_id, 'notification_status')}: {status.replace('proactive_', '').replace('_', ' ').title()}")
             return
         c1, c2, c3 = st.columns([1, 1.5, 1.2])
         if c1.button("I'm okay", use_container_width=True, key=f"accept_{notification['id']}"):
@@ -611,24 +776,24 @@ def notification_actions(notification: dict):
             st.rerun()
         return
     if status in {"accepted", "escalated", "worker_escalated"}:
-        st.caption(f"Notification status: {status.replace('_', ' ').title()}")
+        st.caption(f"{t(user_id, 'notification_status')}: {status.replace('_', ' ').title()}")
         return
     c1, c2, c3 = st.columns([1, 1.55, 1.15])
-    if c1.button("Accept plan", use_container_width=True, key=f"accept_{notification['id']}"):
+    if c1.button(t(user_id, "accept_plan"), use_container_width=True, key=f"accept_{notification['id']}"):
         api("POST", "/worker/notification-response", json={"notification_id": notification["id"], "user_response": "accepted"})
         st.rerun()
-    if c2.button("Suggest different plan", use_container_width=True, key=f"reject_{notification['id']}"):
+    if c2.button(t(user_id, "suggest_plan"), use_container_width=True, key=f"reject_{notification['id']}"):
         api("POST", "/worker/notification-response", json={"notification_id": notification["id"], "user_response": "rejected"})
         st.rerun()
-    if c3.button("Talk to support", use_container_width=True, key=f"support_{notification['id']}"):
+    if c3.button(t(user_id, "talk_support"), use_container_width=True, key=f"support_{notification['id']}"):
         api("POST", "/worker/notification-response", json={"notification_id": notification["id"], "user_response": "support_requested"})
         st.rerun()
 
 
-def render_notification(notification: dict | None):
+def render_notification(notification: dict | None, user_id: str):
     if not notification:
         st.markdown(
-            '<div class="notification notification-collection"><b>No active message from Grab</b><br>You have no repayment notification right now.</div>',
+            f"<div class=\"notification notification-collection\"><b>{escape(t(user_id, 'no_active_title'))}</b><br>{escape(t(user_id, 'no_active_body'))}</div>",
             unsafe_allow_html=True,
         )
         return
@@ -643,36 +808,37 @@ def render_notification(notification: dict | None):
             """,
             unsafe_allow_html=True,
         )
-        notification_actions(notification)
+        notification_actions(notification, user_id)
         return
     message = notification.get("message") or ""
     if not plain_text(message):
         message = (
             notification.get("escalation_summary")
-            or "Your case is being reviewed by our support team, who will contact you shortly."
+            or t(user_id, "support_review")
         )
+    message = localized_collection_message(user_id, notification, message)
     plan = notification.get("repayment_plan") or {}
     lines = []
     for idx, item in enumerate(plan.get("installments") or [], start=1):
         lines.append(
-            f"<div class='plan-line'><div>Installment {idx}</div><div>{sgd(item.get('amount', 0))}</div><div>{fmt_date(str(item.get('due_date', '')))}</div></div>"
+            f"<div class='plan-line'><div>{escape(t(user_id, 'installment'))} {idx}</div><div>{sgd(item.get('amount', 0))}</div><div>{fmt_date(str(item.get('due_date', '')))}</div></div>"
         )
     plan_html = (
-        f"<div class='plan-box'><b>Repayment plan offered</b>{''.join(lines)}</div>"
+        f"<div class='plan-box'><b>{escape(t(user_id, 'plan_offered'))}</b>{''.join(lines)}</div>"
         if lines
         else ""
     )
     st.markdown(
         f"""
         <div class="notification notification-collection">
-          <b>New message from Grab</b><br>
+          <b>{escape(t(user_id, 'new_message'))}</b><br>
           {escape(message)}
           {plan_html}
         </div>
         """,
         unsafe_allow_html=True,
     )
-    notification_actions(notification)
+    notification_actions(notification, user_id)
 
 
 def render_health_card(health: dict):
@@ -735,14 +901,18 @@ def render_earnings_chart(earnings: list[dict]):
 def render_worker_history(overview: dict):
     notifications = overview["notifications"]
     negotiations = overview["negotiations"]
+    user_id = overview["profile"]["user_id"]
     if notifications:
         for n in reversed(notifications[-4:]):
-            label = "Support check-in" if notification_type(n) == "proactive_checkin" else "Agent message"
+            label = t(user_id, "support_checkin") if notification_type(n) == "proactive_checkin" else t(user_id, "agent_message")
+            body = n.get("message") or ""
+            if notification_type(n) != "proactive_checkin":
+                body = localized_collection_message(user_id, n, body)
             st.markdown(
                 f"""
                 <div class="timeline-card">
                   <div class="avatar" style="height:32px;width:32px;">G</div>
-                  <div><b>{fmt_date(n['created_at'])} | {escape(label)}</b><br>{escape(n.get('message') or '')}</div>
+                  <div><b>{fmt_date(n['created_at'])} | {escape(label)}</b><br>{escape(body)}</div>
                 </div>
                 """,
                 unsafe_allow_html=True,
@@ -755,12 +925,24 @@ def render_worker():
     users = api("GET", "/users")
     labels = {f"{u['name']} ({u['user_id']})": u["user_id"] for u in users}
     st.markdown('<div class="page">', unsafe_allow_html=True)
-    top_l, top_r = st.columns([4, 1])
+    lang_prefs = st.session_state.setdefault("worker_language_preferences", {})
+    top_l, top_m, top_r = st.columns([3.3, 1.8, 1])
     selected = top_l.selectbox("Worker authentication", labels.keys())
-    if top_r.button("Switch role", use_container_width=True):
+    user_id = labels[selected]
+    option_labels = [label for _, label in LANGUAGE_OPTIONS]
+    current_locale = lang_prefs.get(user_id, WORKER_LOCALES.get(user_id, "en"))
+    selected_index = next((idx for idx, (code, _) in enumerate(LANGUAGE_OPTIONS) if code == current_locale), 0)
+    selected_label = top_m.selectbox(
+        t(user_id, "language_pref"),
+        option_labels,
+        index=selected_index,
+        key=f"worker_language_selector_{user_id}",
+    )
+    selected_locale = next(code for code, label in LANGUAGE_OPTIONS if label == selected_label)
+    lang_prefs[user_id] = selected_locale
+    if top_r.button(t(user_id, "switch_role"), use_container_width=True):
         st.session_state.pop("role", None)
         st.rerun()
-    user_id = labels[selected]
     overview = api("GET", f"/worker/{user_id}/overview")
     profile = overview["profile"]
     payment = overview["payment"]
@@ -785,9 +967,9 @@ def render_worker():
         """,
         unsafe_allow_html=True,
     )
-    render_notification(latest_notification)
+    render_notification(latest_notification, user_id)
 
-    tabs = st.tabs(["Overview", "Earnings", "History"])
+    tabs = st.tabs([t(user_id, "overview"), t(user_id, "earnings"), t(user_id, "history")])
     with tabs[0]:
         c1, c2 = st.columns([1, 2.2])
         with c1:
@@ -825,4 +1007,6 @@ try:
     else:
         render_worker()
 except httpx.HTTPError as exc:
-    st.error(f"API unavailable at {API_URL}: {exc}")
+    st.error(f"API request failed: {exc}")
+except Exception as exc:
+    st.error(f"App failed: {exc}")
