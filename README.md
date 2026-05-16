@@ -13,12 +13,14 @@ This is a demo environment, not a production app. Role switching is done inside 
 
 - Portfolio metrics such as recovery rate, revenue at risk, escalated cases, frozen cases, and average health score
 - Worker table with gig type, health score, risk tier, amount due, overdue days, and broken commitment count
+- Drift Scanner that runs across the worker base, detects early pattern drift, and lets admins send proactive support check-ins
 - Escalation queue for workers whose cases are frozen or escalated
 - Manual "Trigger agent" action that runs the agent graph and delivers a notification to the worker view
 
 ### Gig worker experience
 
 - Latest message from the collections agent
+- Proactive support check-ins that look and behave differently from collections messages
 - Repayment plan with installment dates and amounts when a plan is offered
 - Actions to accept a plan, ask for a different plan, or request support
 - Financial health score and component breakdown
@@ -28,9 +30,11 @@ This is a demo environment, not a production app. Role switching is done inside 
 ### Agent workflow
 
 - Reads overdue payment state, earnings patterns, and financial health
+- Scans for pre-default drift signals such as timing shifts, consistency drops, and baseline pattern mismatch
 - Classifies risk into `low`, `medium`, `high`, or `hardship`
 - Generates a repayment plan aligned to earnings windows
 - Drafts an empathetic worker-facing message
+- Drafts soft proactive check-ins when a worker is drifting before a likely missed payment
 - Handles worker responses:
   - `accepted` -> move case into active negotiation
   - `rejected` -> generate a counter-offer
@@ -58,11 +62,20 @@ Copy-Item .env.example .env
 
 Then configure `.env`:
 
-- Set `GEMINI_API_KEY` to use Gemini for agent messages and escalation summaries, or
-- Set `USE_MOCK_LLM=true` for a fully offline demo flow
+- Live LLM calls use AWS Bedrock only
+- The app now creates Bedrock clients from `.env`, so temporary AWS session credentials can be set directly in the file
+- Set `AWS_DEFAULT_REGION` or `BEDROCK_REGION`
+- Set `BEDROCK_REASONING_MODEL` and `BEDROCK_FAST_MODEL`
+- Set `USE_MOCK_LLM=true` only if you want a fully offline demo flow
 
 Key config values:
 
+- `AWS_ACCESS_KEY_ID`
+- `AWS_SECRET_ACCESS_KEY`
+- `AWS_SESSION_TOKEN`
+- `AWS_DEFAULT_REGION` or `BEDROCK_REGION`
+- `BEDROCK_REASONING_MODEL=deepseek.v3.2`
+- `BEDROCK_FAST_MODEL=deepseek.v3.2`
 - `DATABASE_URL=sqlite:///./grab_collections.db`
 - `COMMITMENT_FREEZE_THRESHOLD=2`
 - `API_URL` for the Streamlit app defaults to `http://localhost:8000`
@@ -122,6 +135,8 @@ These seeded workers are the easiest ones to use in a walkthrough:
 
 - `POST /trigger-agent` -> runs the graph and returns the agent response
 - `POST /notifications/send` -> runs the graph and stores/delivers a worker notification
+- `GET /drift-scan` -> scans all workers for early default-pattern drift
+- `POST /notifications/send-proactive-checkin` -> delivers a soft proactive check-in to a drifting worker
 - `POST /user-response` -> handles response against a saved agent state
 - `POST /worker/notification-response` -> worker-facing accept/reject/support action
 - `POST /mark-payment-missed` -> records a missed installment and freezes restructuring after threshold
@@ -152,5 +167,6 @@ curl http://localhost:8000/worker/GW001/overview
 - Worker identity is selected from a dropdown in the UI
 - Notifications are persisted in SQLite and shown in the worker view; there is no real push channel
 - The `agent/memory.py` helper exists, but the current UI/API flow relies on database-backed notifications, negotiations, and agent session state
+- Live LLM calls use a shared Bedrock runtime model factory built on `boto3.client(...).invoke_model(...)`, matching the sample request shape, and all LangGraph agent LLM calls read model IDs and AWS credentials from `.env`
 - All currency is shown in SGD
 - Payment scheduling and seeded demo data use `Asia/Singapore`

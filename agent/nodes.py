@@ -1,12 +1,11 @@
 import json
 import os
-import time
 from datetime import datetime
 
-import httpx
 from dotenv import load_dotenv
 from sqlmodel import select
 
+from agent.model_factory import get_model_factory
 from agent.state import AgentState
 from agent.tools import (
     analyze_earning_windows,
@@ -42,110 +41,37 @@ class MockChatModel:
         return type("MockResponse", (), {"content": content})()
 
 
-class GeminiChatModel:
-    def __init__(self, model: str, temperature: float, max_tokens: int):
-        self.model = model
-        self.temperature = temperature
-        self.max_tokens = max_tokens
-        self.api_key = os.getenv("GEMINI_API_KEY", "")
-        self.base_url = os.getenv("GEMINI_API_BASE_URL", "https://generativelanguage.googleapis.com/v1beta").rstrip("/")
-
-    def invoke(self, prompt):
-        if not self.api_key:
-            raise RuntimeError("GEMINI_API_KEY is not set. Add it to .env or set USE_MOCK_LLM=true.")
-        payload = {
-            "contents": [
-                {
-                    "role": "user",
-                    "parts": [{"text": str(prompt)}],
-                }
-            ],
-            "generationConfig": {
-                "temperature": self.temperature,
-                "maxOutputTokens": self.max_tokens,
-            },
-        }
-        headers = {
-            "Content-Type": "application/json",
-        }
-        response = None
-        for attempt in range(3):
-            response = httpx.post(
-                f"{self.base_url}/models/{self.model}:generateContent",
-                params={"key": self.api_key},
-                headers=headers,
-                json=payload,
-                timeout=45.0,
-            )
-            if response.status_code != 429:
-                break
-            time.sleep(2 * (attempt + 1))
-
-        if response.status_code == 429:
-            raise RuntimeError(
-                "LLM provider returned 429 Too Many Requests. Check API quota/billing, "
-                "wait briefly, or switch to a lower-cost model in GEMINI_REASONING_MODEL."
-            )
-        if response.status_code in {401, 403}:
-            raise RuntimeError(
-                "Gemini rejected the API key or model access. Check GEMINI_API_KEY "
-                "and the configured model names in .env."
-            )
-        response.raise_for_status()
-        data = response.json()
-        candidates = data.get("candidates") or []
-        parts = (candidates[0].get("content", {}).get("parts") or []) if candidates else []
-        content = "\n".join(part.get("text", "") for part in parts).strip()
-        if not content:
-            raise RuntimeError(f"Gemini returned no text content: {data}")
-        return type("LLMResponse", (), {"content": content})()
+def _build_live_llms():
+    factory = get_model_factory()
+    return (factory.create_reasoning_model(), factory.create_fast_model())
 
 
 if USE_MOCK_LLM:
     reasoning_llm = MockChatModel("reasoning")
     fast_llm = MockChatModel("fast")
 else:
-    reasoning_llm = GeminiChatModel(
-        model=os.getenv("GEMINI_REASONING_MODEL", "gemini-2.5-flash"),
-        temperature=0.3,
-        max_tokens=1000,
-    )
-    fast_llm = GeminiChatModel(
-        model=os.getenv("GEMINI_FAST_MODEL", "gemini-2.5-flash"),
-        temperature=0.1,
-        max_tokens=300,
-    )
-
-    # Bedrock config is parked for later. Uncomment this block when AWS credentials
-    # are available and switch the model setup back to ChatBedrock.
-    # from langchain_aws import ChatBedrock
-    #
-    # reasoning_llm = ChatBedrock(
-    #     model_id=os.getenv("BEDROCK_REASONING_MODEL"),
-    #     region_name=os.getenv("BEDROCK_REGION"),
-    #     model_kwargs={"temperature": 0.3, "max_tokens": 1000},
-    # )
-    # fast_llm = ChatBedrock(
-    #     model_id=os.getenv("BEDROCK_FAST_MODEL"),
-    #     region_name=os.getenv("BEDROCK_REGION"),
-    #     model_kwargs={"temperature": 0.1, "max_tokens": 300},
-    # )
+    reasoning_llm, fast_llm = _build_live_llms()
 
 
 def _content(response) -> str:
+    if hasattr(response, "content"):
+        return response.content
+    if hasattr(response, "text"):
+        return response.text()
     return getattr(response, "content", str(response))
 
 
 def _llm_error_message(exc: Exception) -> str:
-    if "GEMINI_API_KEY" in str(exc):
-        return "Gemini API key is missing. Add GEMINI_API_KEY to your .env file, then restart the backend."
-    if "429" in str(exc) or "Too Many Requests" in str(exc):
-        return (
-            "Gemini is rate-limiting or the account quota is exhausted. "
-            "Check billing/quota, wait a minute, or use a lower-cost model."
-        )
-    if "401" in str(exc) or "403" in str(exc):
-        return "Gemini rejected the key or model access. Check GEMINI_API_KEY and model names in .env."
+    if "BEDROCK_REGION" in str(exc) or "AWS_DEFAULT_REGION" in str(exc):
+        return "AWS region is missing. Set BEDROCK_REGION or AWS_DEFAULT_REGION, then restart the backend."
+    if "Unable to locate credentials" in str(exc):
+        return "AWS credentials were not found. Export AWS credentials in your environment, then restart the backend."
+    if "InvalidClientTokenId" in str(exc) or "UnrecognizedClientException" in str(exc):
+        return "AWS credentials or session token are invalid. Refresh the active AWS credentials and restart the backend."
+    if "ExpiredToken" in str(exc):
+        return "AWS session credentials have expired. Refresh AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, and AWS_SESSION_TOKEN, then restart the backend."
+    if "AccessDenied" in str(exc) or "not authorized" in str(exc).lower():
+        return "AWS denied Bedrock access. Check the IAM permissions for your current credentials and the chosen model IDs."
     return f"LLM call failed: {exc}"
 
 

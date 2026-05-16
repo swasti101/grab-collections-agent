@@ -10,6 +10,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from sqlmodel import select
 
+from agent.drift import scan_all_workers
 from agent.graph import agent_graph
 from agent.nodes import (
     node_classify_risk,
@@ -23,6 +24,7 @@ from agent.tools import classify_risk
 from api.models import (
     AgentResponse,
     MarkPaymentMissedRequest,
+    SendProactiveCheckInRequest,
     SendNotificationRequest,
     TriggerAgentRequest,
     UserResponseRequest,
@@ -159,15 +161,64 @@ def _store_notification(state: AgentState, state_id: str) -> WorkerNotification:
         return notification
 
 
+def _notification_type(notification: WorkerNotification) -> str:
+    return "proactive_checkin" if notification.status.startswith("proactive_") else "collections"
+
+
+def _store_proactive_notification(req: SendProactiveCheckInRequest) -> WorkerNotification:
+    with get_session() as session:
+        payment = session.exec(select(Payment).where(Payment.user_id == req.user_id)).first()
+        if not payment:
+            raise HTTPException(status_code=404, detail="User/payment not found")
+
+        existing = session.exec(
+            select(WorkerNotification)
+            .where(WorkerNotification.user_id == req.user_id)
+            .order_by(WorkerNotification.created_at)
+        ).all()
+        open_proactive = next(
+            (
+                notification
+                for notification in reversed(existing)
+                if notification.status in {"proactive_unread", "proactive_options_requested", "proactive_support_requested"}
+            ),
+            None,
+        )
+        if open_proactive:
+            open_proactive.message = req.message
+            open_proactive.escalation_summary = req.drift_summary
+            open_proactive.updated_at = datetime.utcnow()
+            session.add(open_proactive)
+            session.commit()
+            session.refresh(open_proactive)
+            return open_proactive
+
+        notification = WorkerNotification(
+            user_id=req.user_id,
+            payment_id=payment.id,
+            state_id=f"drift-{uuid.uuid4()}",
+            message=req.message,
+            repayment_plan="{}",
+            status="proactive_unread",
+            escalation_summary=req.drift_summary,
+        )
+        session.add(notification)
+        session.commit()
+        session.refresh(notification)
+        return notification
+
+
 def _notification_payload(notification: WorkerNotification) -> dict:
     return {
         "id": notification.id,
         "user_id": notification.user_id,
         "payment_id": notification.payment_id,
         "state_id": notification.state_id,
+        "notification_type": _notification_type(notification),
         "message": notification.message,
         "repayment_plan": json.loads(notification.repayment_plan or "{}"),
         "status": notification.status,
+        "drift_summary": notification.escalation_summary if _notification_type(notification) == "proactive_checkin" else None,
         "escalation_summary": notification.escalation_summary,
         "created_at": notification.created_at.isoformat(),
         "updated_at": notification.updated_at.isoformat(),
@@ -189,6 +240,70 @@ def send_notification(req: SendNotificationRequest):
         "notification": _notification_payload(notification),
         "agent": _response(state, state_id).model_dump(),
     }
+
+
+@app.get("/drift-scan")
+def drift_scan():
+    results = scan_all_workers()
+    drifting = [row for row in results if row.get("drifting")]
+    return {
+        "scanned_at": datetime.utcnow().isoformat(),
+        "total_workers": len(results),
+        "drifting_workers": len(drifting),
+        "results": results,
+    }
+
+
+@app.post("/notifications/send-proactive-checkin")
+def send_proactive_checkin(req: SendProactiveCheckInRequest):
+    notification = _store_proactive_notification(req)
+    return {
+        "message": "proactive check-in delivered",
+        "notification": _notification_payload(notification),
+    }
+
+
+def _proactive_response_payload(notification: WorkerNotification) -> dict:
+    return {
+        "state_id": notification.state_id,
+        "agent_message": notification.message,
+        "plan": {},
+        "nudge_at": None,
+        "risk_tier": None,
+        "financial_health": None,
+        "restructuring_frozen": False,
+        "status": notification.status,
+        "escalation_summary": notification.escalation_summary,
+        "next_action": None,
+    }
+
+
+def _handle_proactive_notification_response(req: WorkerNotificationResponseRequest) -> dict:
+    with get_session() as session:
+        notification = session.get(WorkerNotification, req.notification_id)
+        if not notification:
+            raise HTTPException(status_code=404, detail="Notification not found")
+        if req.user_response == "accepted":
+            notification.status = "proactive_acknowledged"
+            notification.message = (
+                "Thanks for checking in. We will keep things flexible on our side, and if your routine changes again you can reach out early anytime."
+            )
+        elif req.user_response == "rejected":
+            notification.status = "proactive_options_requested"
+            notification.message = (
+                "Thanks for raising your hand early. We can talk through lighter options ahead of time so nothing feels rushed closer to your next payment window."
+            )
+        else:
+            notification.status = "proactive_support_requested"
+            notification.message = (
+                "Thanks for letting us know. A support teammate will review this early and help you talk through options before things become urgent."
+            )
+            notification.escalation_summary = notification.escalation_summary or "Worker requested proactive support."
+        notification.updated_at = datetime.utcnow()
+        session.add(notification)
+        session.commit()
+        session.refresh(notification)
+        return _proactive_response_payload(notification)
 
 
 @app.post("/user-response", response_model=AgentResponse)
@@ -223,6 +338,8 @@ def worker_notification_response(req: WorkerNotificationResponseRequest):
         notification = session.get(WorkerNotification, req.notification_id)
         if not notification:
             raise HTTPException(status_code=404, detail="Notification not found")
+        if _notification_type(notification) == "proactive_checkin":
+            return _handle_proactive_notification_response(req)
         state_id = notification.state_id
     response = user_response(UserResponseRequest(state_id=state_id, user_response=req.user_response))
     with get_session() as session:

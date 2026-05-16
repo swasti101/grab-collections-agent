@@ -21,7 +21,7 @@ An AI-assisted payment collections workflow for Grab gig workers. It is a **demo
 | Backend       | FastAPI + SQLModel                                          |
 | Database      | SQLite (`grab_collections.db`)                              |
 | Frontend      | Streamlit                                                   |
-| LLM           | Gemini (via `GEMINI_API_KEY`) or mock (`USE_MOCK_LLM=true`) |
+| LLM           | AWS Bedrock runtime via direct `boto3.client(...).invoke_model(...)` or mock (`USE_MOCK_LLM=true`) |
 | Currency / TZ | SGD / Asia/Singapore                                        |
 
 ---
@@ -54,12 +54,18 @@ ui/      Streamlit admin + worker interface
 
 ## Key configuration (`.env`)
 
-```
-GEMINI_API_KEY=...
-USE_MOCK_LLM=true              # set true for fully offline demo
+```ini
+AWS_ACCESS_KEY_ID=...
+AWS_SECRET_ACCESS_KEY=...
+AWS_SESSION_TOKEN=...
+AWS_DEFAULT_REGION=us-west-2
+BEDROCK_REGION=us-west-2
+BEDROCK_REASONING_MODEL=deepseek.v3.2
+BEDROCK_FAST_MODEL=deepseek.v3.2
+USE_MOCK_LLM=false
 DATABASE_URL=sqlite:///./grab_collections.db
 COMMITMENT_FREEZE_THRESHOLD=2
-API_URL=http://localhost:8000  # used by Streamlit
+API_URL=http://localhost:8000
 ```
 
 ---

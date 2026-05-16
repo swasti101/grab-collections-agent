@@ -49,8 +49,11 @@ st.markdown(
     .health-track {height:7px;background:#333;border-radius:999px;overflow:hidden;display:inline-block;width:64px;margin-right:10px;}
     .health-fill {height:7px;border-radius:999px;}
     .quote {border-left:2px solid #777;padding-left:12px;color:#d1cdc5;font-weight:700;line-height:1.45;}
-    .notification {background:#e9f5ff;color:#084d91;border-color:#b9d8f3;padding:16px;margin:10px 0 18px;}
+    .notification {padding:16px;margin:10px 0 18px;}
     .notification * {color:inherit;}
+    .notification-collection {background:#e9f5ff;color:#084d91;border-color:#b9d8f3;}
+    .notification-proactive {background:#f3eee3;color:#59442a;border-color:#cdbb98;}
+    .notification-proactive .subtle {color:#7a6247;font-weight:800;font-size:.85rem;letter-spacing:.02em;text-transform:uppercase;}
     .plan-box {background:rgba(255,255,255,.18);border:1px solid rgba(255,255,255,.22);border-radius:8px;padding:12px;margin:12px 0;}
     .plan-line {display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;padding:8px 0;border-top:1px solid rgba(255,255,255,.18);font-weight:800;}
     .plan-line:first-child {border-top:0;}
@@ -79,6 +82,13 @@ st.markdown(
     .modal-stat-label {color:#bdb9b1;font-size:.85rem;font-weight:800;}
     .modal-stat-value {color:#fff;font-size:1.15rem;font-weight:900;line-height:1.2;}
     .modal-note {background:#282827;border:1px solid #3f3f3d;border-radius:8px;padding:14px;color:#e0ddd6;font-weight:700;line-height:1.5;}
+    .drift-card {padding:16px;margin-bottom:14px;}
+    .drift-top {display:flex;justify-content:space-between;align-items:flex-start;gap:12px;margin-bottom:12px;}
+    .drift-box {border:1px solid #484845;border-radius:10px;background:#222220;padding:14px 16px;margin:12px 0;color:#f1efe9;font-family:Consolas, monospace;}
+    .drift-line {margin:4px 0;font-size:.95rem;}
+    .drift-preview {border-left:3px solid #8e846a;padding-left:12px;color:#ddd7cb;font-style:italic;font-size:1.03rem;line-height:1.5;margin:14px 0;}
+    .drift-meta {color:#c7c3bc;font-weight:800;line-height:1.45;}
+    .pill-proactive {display:inline-block;border-radius:999px;padding:3px 10px;font-weight:900;font-size:.78rem;background:#f3eee3;color:#59442a;border:1px solid #cdbb98;}
     div[data-testid="stButton"] button {border-radius:8px;font-weight:800;}
     div[data-testid="stDataFrame"] {border:1px solid #3f3f3d;border-radius:8px;}
     </style>
@@ -121,6 +131,16 @@ def health_color(score: int) -> str:
     return "#ef5350"
 
 
+def notification_type(notification: dict | None) -> str:
+    if not notification:
+        return "collections"
+    kind = str(notification.get("notification_type") or "")
+    if kind:
+        return kind
+    status = str(notification.get("status") or "")
+    return "proactive_checkin" if status.startswith("proactive_") else "collections"
+
+
 def fmt_date(value: str) -> str:
     try:
         return datetime.fromisoformat(value.replace("Z", "")).strftime("%d %b %Y")
@@ -137,6 +157,32 @@ def plain_text(value: str) -> str:
     text = re.sub(r"<[^>]+>", " ", text)
     text = re.sub(r"\s+", " ", text).strip()
     return text
+
+
+def payment_timing_text(payment: dict) -> tuple[str, str]:
+    due_raw = str(payment.get("due_date") or "")
+    try:
+        due_date = datetime.fromisoformat(due_raw).date()
+        today = datetime.now().date()
+        delta = (due_date - today).days
+        if delta > 0:
+            return "Due date", f"{fmt_date(due_raw)} ({delta} days away)"
+        if delta == 0:
+            return "Due date", f"{fmt_date(due_raw)} (today)"
+    except Exception:
+        pass
+    overdue_days = int(payment.get("days_overdue") or 0)
+    if overdue_days > 0:
+        return "Days overdue", f"{overdue_days} days"
+    return "Due date", fmt_date(due_raw)
+
+
+def notification_status_label(notification: dict | None) -> str:
+    if not notification:
+        return "No active message"
+    if notification_type(notification) == "proactive_checkin":
+        return str(notification.get("status", "proactive_unread")).replace("proactive_", "").replace("_", " ").title()
+    return str(notification.get("status", "No offer")).replace("_", " ").title()
 
 
 def refresh_admin():
@@ -180,14 +226,17 @@ def render_home():
 
 
 def render_admin_nav(active: str):
-    c1, c2, c3, _ = st.columns([1.1, 1.25, 1.15, 3])
+    c1, c2, c3, c4, _ = st.columns([1.05, 1.2, 1.05, 1.2, 2.5])
     if c1.button("All workers", type="primary" if active == "workers" else "secondary", use_container_width=True):
         st.session_state["admin_tab"] = "workers"
         st.rerun()
     if c2.button("Escalated cases", type="primary" if active == "escalated" else "secondary", use_container_width=True):
         st.session_state["admin_tab"] = "escalated"
         st.rerun()
-    if c3.button("Trigger agent", type="primary" if active == "trigger" else "secondary", use_container_width=True):
+    if c3.button("Drift scanner", type="primary" if active == "drift" else "secondary", use_container_width=True):
+        st.session_state["admin_tab"] = "drift"
+        st.rerun()
+    if c4.button("Trigger agent", type="primary" if active == "trigger" else "secondary", use_container_width=True):
         st.session_state["admin_tab"] = "trigger"
         st.rerun()
 
@@ -437,6 +486,80 @@ def render_trigger_agent(users: list[dict]):
         )
 
 
+def render_drift_scanner():
+    st.markdown(
+        '<p class="metric-subtle">Run one scan across the full worker base, spot drift before a missed payment happens, and send a soft proactive check-in instead of a collections message.</p>',
+        unsafe_allow_html=True,
+    )
+    c1, c2 = st.columns([1.25, 4])
+    if c1.button("Run drift scanner", type="primary", use_container_width=True, key="run_drift_scanner"):
+        st.session_state["drift_scan"] = api("GET", "/drift-scan")
+        st.rerun()
+    if c2.button("Clear scan", use_container_width=True, key="clear_drift_scan"):
+        st.session_state.pop("drift_scan", None)
+        st.rerun()
+
+    scan = st.session_state.get("drift_scan")
+    if not scan:
+        st.info("No scan has been run yet.")
+        return
+
+    results = scan.get("results") or []
+    drifting = [row for row in results if row.get("drifting")]
+    metric_cols = st.columns(3)
+    with metric_cols[0]:
+        render_metric("Workers scanned", str(scan.get("total_workers", 0)), fmt_date(scan.get("scanned_at", "")))
+    with metric_cols[1]:
+        render_metric("Drift signals", str(scan.get("drifting_workers", 0)), "watchlist surfaced", "warn" if drifting else "")
+    with metric_cols[2]:
+        max_score = max((float(row.get("drift_score") or 0) for row in drifting), default=0)
+        render_metric("Highest drift", f"{max_score:.2f}", "score out of 1.00")
+
+    if not drifting:
+        st.success("No workers crossed the drift threshold on this run.")
+        return
+
+    for row in drifting:
+        summary_html = "".join(f"<div class='drift-line'>{escape(line)}</div>" for line in row.get("summary_lines") or [])
+        st.markdown(
+            f"""
+            <div class="panel drift-card">
+              <div class="drift-top">
+                <div>
+                  <b style="font-size:1.18rem;color:#fff;">{escape(row['name'])}</b><br>
+                  <span class="pill-proactive">Drift detected</span>
+                  <span class="badge {risk_class('high' if float(row.get('drift_score') or 0) >= 0.7 else 'medium')}">{float(row.get('drift_score') or 0):.2f}</span>
+                </div>
+                <div class="drift-meta">{escape(row['user_id'])} | {escape(row['gig_type'].replace('_', '-').title())}<br>{escape(row.get('due_context') or '')}</div>
+              </div>
+              <div class="drift-box">{summary_html}</div>
+              <div class="metric-label">PROACTIVE MESSAGE PREVIEW</div>
+              <div class="drift-preview">{escape(row.get('preview_message') or '')}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        sent_status = str(row.get("latest_proactive_status") or "")
+        can_send = bool(row.get("can_send_checkin"))
+        label = f"Send check-in to {row['user_id']}"
+        if st.button(label, type="primary", use_container_width=True, key=f"drift_send_{row['user_id']}", disabled=not can_send):
+            api(
+                "POST",
+                "/notifications/send-proactive-checkin",
+                json={
+                    "user_id": row["user_id"],
+                    "message": row.get("preview_message") or "",
+                    "drift_summary": "\n".join(row.get("summary_lines") or []),
+                },
+            )
+            st.session_state["drift_scan"] = api("GET", "/drift-scan")
+            refresh_admin()
+            st.success(f"Proactive check-in delivered to {row['user_id']}")
+            st.rerun()
+        if sent_status and not can_send:
+            st.caption(f"Open proactive check-in already exists: {sent_status.replace('proactive_', '').replace('_', ' ').title()}")
+
+
 def render_admin():
     refresh_admin()
     dashboard = st.session_state["dashboard"]
@@ -462,6 +585,8 @@ def render_admin():
             st.bar_chart(pd.DataFrame(dashboard["health_by_gig_type"]).set_index("gig_type"))
     elif active == "escalated":
         render_escalations(dashboard)
+    elif active == "drift":
+        render_drift_scanner()
     else:
         render_trigger_agent(users)
     st.markdown("</div>", unsafe_allow_html=True)
@@ -469,6 +594,22 @@ def render_admin():
 
 def notification_actions(notification: dict):
     status = notification.get("status")
+    kind = notification_type(notification)
+    if kind == "proactive_checkin":
+        if status in {"proactive_acknowledged", "proactive_options_requested", "proactive_support_requested"}:
+            st.caption(f"Check-in status: {status.replace('proactive_', '').replace('_', ' ').title()}")
+            return
+        c1, c2, c3 = st.columns([1, 1.5, 1.2])
+        if c1.button("I'm okay", use_container_width=True, key=f"accept_{notification['id']}"):
+            api("POST", "/worker/notification-response", json={"notification_id": notification["id"], "user_response": "accepted"})
+            st.rerun()
+        if c2.button("Talk through options early", use_container_width=True, key=f"reject_{notification['id']}"):
+            api("POST", "/worker/notification-response", json={"notification_id": notification["id"], "user_response": "rejected"})
+            st.rerun()
+        if c3.button("Talk to support", use_container_width=True, key=f"support_{notification['id']}"):
+            api("POST", "/worker/notification-response", json={"notification_id": notification["id"], "user_response": "support_requested"})
+            st.rerun()
+        return
     if status in {"accepted", "escalated", "worker_escalated"}:
         st.caption(f"Notification status: {status.replace('_', ' ').title()}")
         return
@@ -486,7 +627,23 @@ def notification_actions(notification: dict):
 
 def render_notification(notification: dict | None):
     if not notification:
-        st.markdown('<div class="notification"><b>No active message from Grab</b><br>You have no repayment notification right now.</div>', unsafe_allow_html=True)
+        st.markdown(
+            '<div class="notification notification-collection"><b>No active message from Grab</b><br>You have no repayment notification right now.</div>',
+            unsafe_allow_html=True,
+        )
+        return
+    if notification_type(notification) == "proactive_checkin":
+        st.markdown(
+            f"""
+            <div class="notification notification-proactive">
+              <div class="subtle">Early support check-in</div>
+              <b>We noticed your routine looks a little different lately</b><br>
+              {escape(notification.get('message') or '')}
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        notification_actions(notification)
         return
     message = notification.get("message") or ""
     if not plain_text(message):
@@ -507,7 +664,7 @@ def render_notification(notification: dict | None):
     )
     st.markdown(
         f"""
-        <div class="notification">
+        <div class="notification notification-collection">
           <b>New message from Grab</b><br>
           {escape(message)}
           {plan_html}
@@ -580,11 +737,12 @@ def render_worker_history(overview: dict):
     negotiations = overview["negotiations"]
     if notifications:
         for n in reversed(notifications[-4:]):
+            label = "Support check-in" if notification_type(n) == "proactive_checkin" else "Agent message"
             st.markdown(
                 f"""
                 <div class="timeline-card">
                   <div class="avatar" style="height:32px;width:32px;">G</div>
-                  <div><b>{fmt_date(n['created_at'])} | Agent message</b><br>{escape(n.get('message') or '')}</div>
+                  <div><b>{fmt_date(n['created_at'])} | {escape(label)}</b><br>{escape(n.get('message') or '')}</div>
                 </div>
                 """,
                 unsafe_allow_html=True,
@@ -609,6 +767,12 @@ def render_worker():
     health = overview["financial_health"]
     notifications = overview["notifications"]
     latest_notification = notifications[-1] if notifications else None
+    due_label, due_value = payment_timing_text(payment)
+    balance_suffix = (
+        '<span class="metric-warn" style="font-size:1rem;">overdue</span>'
+        if int(payment.get("days_overdue") or 0) > 0
+        else '<span class="metric-subtle" style="font-size:1rem;">upcoming</span>'
+    )
 
     initials = "".join(part[0] for part in profile["name"].split()[:2]).upper()
     st.markdown(
@@ -633,10 +797,10 @@ def render_worker():
                 f"""
                 <div class="panel">
                   <div class="metric-label">CURRENT BALANCE</div>
-                  <div class="metric-value">{sgd(payment['amount_due'])} <span class="metric-warn" style="font-size:1rem;">overdue</span></div>
-                  <div class="plan-line"><div>Due date</div><div></div><div>{fmt_date(payment['due_date'])}</div></div>
-                  <div class="plan-line"><div>Days overdue</div><div></div><div>{int(payment['days_overdue'])} days</div></div>
-                  <div class="plan-line"><div>Plan status</div><div></div><div>{escape(str(latest_notification.get('status', 'No offer') if latest_notification else 'No offer').replace('_', ' ').title())}</div></div>
+                  <div class="metric-value">{sgd(payment['amount_due'])} {balance_suffix}</div>
+                  <div class="plan-line"><div>{escape(due_label)}</div><div></div><div>{escape(due_value)}</div></div>
+                  <div class="plan-line"><div>Notification type</div><div></div><div>{escape('Support check-in' if notification_type(latest_notification) == 'proactive_checkin' else 'Collections message' if latest_notification else 'No active message')}</div></div>
+                  <div class="plan-line"><div>Notification status</div><div></div><div>{escape(notification_status_label(latest_notification))}</div></div>
                 </div>
                 """,
                 unsafe_allow_html=True,

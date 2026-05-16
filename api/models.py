@@ -21,6 +21,12 @@ class SendNotificationRequest(BaseModel):
     user_id: str
 
 
+class SendProactiveCheckInRequest(BaseModel):
+    user_id: str
+    message: str
+    drift_summary: Optional[str] = None
+
+
 class WorkerNotificationResponseRequest(BaseModel):
     notification_id: int
     user_response: Literal["accepted", "rejected", "support_requested"]
