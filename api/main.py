@@ -8,9 +8,10 @@ import pytz
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from sqlmodel import select
 
-from agent.drift import scan_all_workers
+from agent.drift import scan_all_workers_with_trace, stream_drift_scan_with_trace
 from agent.graph import agent_graph
 from agent.nodes import (
     node_classify_risk,
@@ -20,11 +21,13 @@ from agent.nodes import (
     node_handle_response,
 )
 from agent.state import AgentState
+from agent.trace import run_agent_preview, stream_agent_preview
 from agent.tools import classify_risk
 from api.models import (
     AgentResponse,
     MarkPaymentMissedRequest,
     SendProactiveCheckInRequest,
+    SendPreviewNotificationRequest,
     SendNotificationRequest,
     TriggerAgentRequest,
     UserResponseRequest,
@@ -144,6 +147,47 @@ def _run_agent_for_user(user_id: str) -> tuple[AgentState, str]:
     return state, state_id
 
 
+def _load_payment_for_user(user_id: str) -> Payment:
+    with get_session() as session:
+        payment = session.exec(select(Payment).where(Payment.user_id == user_id)).first()
+        if not payment:
+            raise HTTPException(status_code=404, detail="User/payment not found")
+        return payment
+
+
+def _notification_preview_from_state(state: AgentState, state_id: str) -> dict:
+    return {
+        "state_id": state_id,
+        "notification_type": "collections",
+        "status": "ready_for_review",
+        "message": state.get("agent_message") or "",
+        "repayment_plan": state.get("repayment_plan") or {},
+        "escalation_summary": state.get("escalation_summary"),
+    }
+
+
+def _agent_preview_payload(user_id: str) -> dict:
+    payment = _load_payment_for_user(user_id)
+    initial_state = _state_from_payment(payment)
+    try:
+        final_state, trace_steps, raw_trace = run_agent_preview(initial_state)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Agent preview failed: {exc}") from exc
+    state_id = _save_state(final_state)
+    return {
+        "state_id": state_id,
+        "user_id": user_id,
+        "trace_steps": trace_steps,
+        "langgraph_trace": raw_trace,
+        "agent": _response(final_state, state_id).model_dump(),
+        "notification_preview": _notification_preview_from_state(final_state, state_id),
+    }
+
+
+def _stream_json_line(payload: dict) -> str:
+    return json.dumps(payload, default=str) + "\n"
+
+
 def _store_notification(state: AgentState, state_id: str) -> WorkerNotification:
     with get_session() as session:
         notification = WorkerNotification(
@@ -231,6 +275,48 @@ def trigger_agent(req: TriggerAgentRequest):
     return _response(state, state_id)
 
 
+@app.post("/agent-preview")
+def agent_preview(req: TriggerAgentRequest):
+    return _agent_preview_payload(req.user_id)
+
+
+@app.post("/agent-preview/stream")
+def agent_preview_stream(req: TriggerAgentRequest):
+    def generate():
+        payment = _load_payment_for_user(req.user_id)
+        initial_state = _state_from_payment(payment)
+        yield _stream_json_line({"event": "started", "user_id": req.user_id})
+        final_payload = None
+        for event in stream_agent_preview(initial_state):
+            if event.get("event") == "step":
+                yield _stream_json_line(event)
+                continue
+            final_state = event["final_state"]
+            state_id = _save_state(final_state)
+            final_payload = {
+                "state_id": state_id,
+                "user_id": req.user_id,
+                "trace_steps": event["trace_steps"],
+                "langgraph_trace": event["langgraph_trace"],
+                "agent": _response(final_state, state_id).model_dump(),
+                "notification_preview": _notification_preview_from_state(final_state, state_id),
+            }
+        yield _stream_json_line({"event": "completed", "preview": final_payload})
+
+    return StreamingResponse(generate(), media_type="application/x-ndjson")
+
+
+@app.post("/notifications/send-previewed")
+def send_previewed_notification(req: SendPreviewNotificationRequest):
+    state = _load_state(req.state_id)
+    notification = _store_notification(state, req.state_id)
+    return {
+        "message": "notification delivered",
+        "notification": _notification_payload(notification),
+        "agent": _response(state, req.state_id).model_dump(),
+    }
+
+
 @app.post("/notifications/send")
 def send_notification(req: SendNotificationRequest):
     state, state_id = _run_agent_for_user(req.user_id)
@@ -244,14 +330,39 @@ def send_notification(req: SendNotificationRequest):
 
 @app.get("/drift-scan")
 def drift_scan():
-    results = scan_all_workers()
+    scan = scan_all_workers_with_trace()
+    results = scan["results"]
     drifting = [row for row in results if row.get("drifting")]
     return {
         "scanned_at": datetime.utcnow().isoformat(),
         "total_workers": len(results),
         "drifting_workers": len(drifting),
+        "scan_trace": scan["scan_trace"],
         "results": results,
     }
+
+
+@app.get("/drift-scan/stream")
+def drift_scan_stream():
+    def generate():
+        yield _stream_json_line({"event": "started"})
+        final_payload = None
+        for event in stream_drift_scan_with_trace():
+            if event.get("event") == "completed":
+                results = event["results"]
+                drifting = [row for row in results if row.get("drifting")]
+                final_payload = {
+                    "scanned_at": datetime.utcnow().isoformat(),
+                    "total_workers": len(results),
+                    "drifting_workers": len(drifting),
+                    "scan_trace": event["scan_trace"],
+                    "results": results,
+                }
+                continue
+            yield _stream_json_line(event)
+        yield _stream_json_line({"event": "completed", "scan": final_payload})
+
+    return StreamingResponse(generate(), media_type="application/x-ndjson")
 
 
 @app.post("/notifications/send-proactive-checkin")

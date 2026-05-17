@@ -1,55 +1,263 @@
 # Grab Collections Agent Demo
 
-Demo repo for an AI-assisted payment collections workflow for Grab gig workers. The app is built as a two-sided demo:
+Demo repo for an AI-assisted collections workflow for Grab gig workers. The app is intentionally built as a two-sided demo:
 
-- `Admin view`: portfolio summary, worker-level risk/health data, escalated cases, and manual agent triggering
-- `Gig worker view`: the latest repayment message, proposed plan, earnings/health context, negotiation history, and commitment breach history
+- `Admin dashboard`: portfolio view, escalations, drift scan, trigger-agent preview, and explicit send approval
+- `Gig worker view`: notification card / popup-style message surface, repayment plan, financial health, earnings context, and negotiation history
 
-This is a demo environment, not a production app. Role switching is done inside the UI and worker selection is manual; there is no real authentication or authorization layer yet.
+This is a demo environment, not a production app. Role switching is manual inside the UI and there is no real authentication layer yet.
 
-## What the demo currently includes
+## What The Demo Shows
 
 ### Admin experience
 
-- Portfolio metrics such as recovery rate, revenue at risk, escalated cases, frozen cases, and average health score
-- Worker table with gig type, health score, risk tier, amount due, overdue days, and broken commitment count
-- Drift Scanner that runs across the worker base, detects early pattern drift, and lets admins send proactive support check-ins
-- Escalation queue for workers whose cases are frozen or escalated
-- Manual "Trigger agent" action that runs the agent graph and delivers a notification to the worker view
+- Portfolio metrics: recovery rate, revenue at risk, escalated cases, frozen cases, average health score
+- Worker table with gig type, health score, risk tier, amount due, overdue days, and broken commitments
+- `Trigger agent` flow that runs the LangGraph collections agent in preview mode first
+- Live trace view showing what the agent is analyzing, which tools are being called, and what each step produced
+- `Drift scanner` that analyzes the full worker base for early default-pattern drift
+- Explicit review-before-send flow for both collections notifications and proactive check-ins
+- Escalation queue for frozen and escalated cases
 
 ### Gig worker experience
 
-- Latest message from the collections agent
-- Proactive support check-ins that look and behave differently from collections messages
-- Repayment plan with installment dates and amounts when a plan is offered
-- Actions to accept a plan, ask for a different plan, or request support
-- Financial health score and component breakdown
-- Last 14 days of earnings plus full earnings history
-- Agent message history, negotiation history, and commitment breach history
+- Notification card / popup-style surface for the latest message from Grab
+- Two distinct message types:
+  - `Collections notification`
+  - `Proactive support check-in`
+- Repayment plan details when the collections agent proposes restructuring
+- Actions to accept, reject / ask for a different plan, or request support
+- Financial health breakdown
+- Recent and full earnings history
+- Negotiation and commitment breach history
 
-### Agent workflow
-
-- Reads overdue payment state, earnings patterns, and financial health
-- Scans for pre-default drift signals such as timing shifts, consistency drops, and baseline pattern mismatch
-- Classifies risk into `low`, `medium`, `high`, or `hardship`
-- Generates a repayment plan aligned to earnings windows
-- Drafts an empathetic worker-facing message
-- Drafts soft proactive check-ins when a worker is drifting before a likely missed payment
-- Handles worker responses:
-  - `accepted` -> move case into active negotiation
-  - `rejected` -> generate a counter-offer
-  - `support_requested` -> escalate to human review
-- Freezes autonomous restructuring after repeated broken commitments and generates an escalation summary for admin/support
-
-## Repo structure
+## Current Architecture
 
 ```text
-agent/   LangGraph flow, node logic, health scoring, and tools
-api/     FastAPI backend and request/response models
-data/    Synthetic data generator for demo personas
-db/      SQLModel database models and session setup
-ui/      Streamlit admin + worker demo interface
+Streamlit Admin UI
+  -> preview stream endpoints on FastAPI
+  -> explicit send endpoints on FastAPI
+
+FastAPI
+  -> LangGraph collections flow
+  -> drift scoring engine
+  -> Bedrock runtime model factory
+  -> SQLModel persistence layer
+
+LangGraph / Drift Engine
+  -> earnings analysis
+  -> risk classification
+  -> repayment plan generation
+  -> collections message drafting
+  -> drift scoring + proactive check-in drafting
+
+SQLite
+  -> payments
+  -> earnings
+  -> financial health scores
+  -> negotiations
+  -> commitment breaches
+  -> worker notifications
+  -> saved agent session state
 ```
+
+### LLM runtime
+
+- Live LLM calls use AWS Bedrock only
+- The shared model abstraction lives in `agent/model_factory.py`
+- The runtime path uses direct `boto3.client(...).invoke_model(...)`
+- Current default model IDs are:
+  - `BEDROCK_REASONING_MODEL=deepseek.v3.2`
+  - `BEDROCK_FAST_MODEL=deepseek.v3.2`
+
+## Current Project Structure
+
+```text
+agent/
+  drift.py            Drift scoring, proactive check-in drafting, scan traces
+  graph.py            LangGraph graph definition and routing
+  health_score.py     Financial health computation
+  memory.py           Legacy helper; current app mostly uses DB-backed state
+  model_factory.py    Shared Bedrock runtime client + model abstraction
+  nodes.py            LangGraph node implementations
+  state.py            Typed graph state
+  tools.py            Tool functions used by the agent nodes
+  trace.py            LangGraph preview/stream trace shaping for the admin UI
+
+api/
+  main.py             FastAPI routes, preview/send flows, worker/admin APIs
+  models.py           Request/response models
+
+db/
+  database.py         SQLModel tables, engine, sessions
+
+data/
+  generate_synthetic_data.py   Seed workers, payments, earnings, breaches
+
+ui/
+  app.py              Streamlit admin + worker demo
+
+requirements.txt      Python dependencies
+.env.example          Example runtime configuration
+grab_collections.db   SQLite database created by the app
+```
+
+## Collections Agent Flow
+
+The current admin `Trigger agent` path is review-first.
+
+### Step-by-step flow
+
+1. Admin selects a worker in the `Trigger agent` tab.
+2. Admin clicks `Run preview`.
+3. Streamlit calls `POST /agent-preview/stream`.
+4. FastAPI starts the LangGraph run and streams node-by-node progress back to the UI.
+5. Admin sees a live arrow flow such as:
+
+```text
+Analyze worker income patterns and financial health
+  -> Check commitment freeze
+  -> Classify repayment risk score
+  -> Generate repayment plan
+  -> Draft worker notification message
+```
+
+6. The UI shows, for each step:
+   - what is being analyzed
+   - which tools were called
+   - what result was produced
+7. The final collections notification is shown in a review card.
+8. Nothing is sent yet.
+9. Admin clicks `Send to worker`.
+10. Streamlit calls `POST /notifications/send-previewed`.
+11. FastAPI persists the notification in `worker_notifications`.
+12. The worker sees the notification card in the worker view.
+
+### Tools called in the collections path
+
+The collections flow currently uses these tool / model calls:
+
+- `analyze_earning_windows`
+- `calculate_financial_health_score`
+- `schedule_nudge`
+- `classify_risk`
+- `generate_repayment_plan`
+- `bedrock.invoke_model` for drafting the worker-facing message
+
+If the case must be escalated, the graph instead drafts a support-facing escalation summary through Bedrock.
+
+## Drift Scanner Flow
+
+The current admin `Drift scanner` path is also review-first.
+
+### What drift scan is trying to predict
+
+The scanner tries to detect workers whose recent earning behavior is drifting toward patterns seen in workers who later defaulted or broke commitments, before another missed payment happens.
+
+### Step-by-step flow
+
+1. Admin opens the `Drift scanner` tab.
+2. Admin clicks `Run drift scanner`.
+3. Streamlit calls `GET /drift-scan/stream`.
+4. FastAPI streams portfolio-wide progress back to the UI.
+5. Admin sees a live arrow flow such as:
+
+```text
+Load worker portfolio for income analysis
+  -> Establish reference default patterns
+  -> Analyze drift across the portfolio
+  -> Draft proactive check-ins
+```
+
+6. The UI also shows worker-by-worker progress like:
+   - `Analyzing recent earning behaviour for GW003`
+   - drift score updates as the scan completes
+7. For each flagged worker, the UI shows:
+   - drift score
+   - timing drift
+   - active-day consistency drop
+   - weekday-pattern correlation
+   - similarity to historical default patterns
+   - proactive message preview
+8. Nothing is sent yet.
+9. Admin clicks `Send check-in`.
+10. Streamlit calls `POST /notifications/send-proactive-checkin`.
+11. FastAPI stores a proactive worker notification.
+12. The worker sees a support-first check-in card that looks different from a collections message.
+
+### Analysis used in drift scan
+
+The drift engine currently uses:
+
+- worker payment record lookup
+- earnings history lookup
+- timing shift detection
+- activity consistency monitoring
+- weekday pattern correlation
+- historical similarity matching against prior defaulters / broken-commitment workers
+- `bedrock.invoke_model` to draft the proactive check-in
+
+## Worker Notification And Negotiation Flow
+
+### Collections notification path
+
+1. Worker opens the worker view.
+2. The latest notification appears in the notification card / popup-style surface.
+3. If it is a collections message, the worker can:
+   - `Accept plan`
+   - `Suggest different plan`
+   - `Talk to support`
+4. Streamlit calls `POST /worker/notification-response`.
+5. FastAPI loads the saved agent state and continues the negotiation.
+
+If the worker rejects the plan:
+
+```text
+node_handle_response
+  -> node_classify_risk
+  -> node_generate_plan
+  -> node_draft_message
+```
+
+That produces a counter-offer and a new message.
+
+### Proactive check-in path
+
+If the worker receives a proactive support check-in, the actions are different:
+
+- `I'm okay`
+- `Talk through options early`
+- `Talk to support`
+
+These do not go through the collections negotiation graph. They update the proactive notification status directly.
+
+## Main API Endpoints
+
+### Preview and send flows
+
+- `POST /agent-preview`
+- `POST /agent-preview/stream`
+- `POST /notifications/send-previewed`
+- `GET /drift-scan`
+- `GET /drift-scan/stream`
+- `POST /notifications/send-proactive-checkin`
+
+### Core agent actions
+
+- `POST /trigger-agent`
+- `POST /notifications/send`
+- `POST /user-response`
+- `POST /worker/notification-response`
+- `POST /mark-payment-missed`
+
+### Admin and worker data
+
+- `GET /users`
+- `GET /dashboard`
+- `GET /worker/{user_id}/overview`
+- `GET /worker/{user_id}/notifications`
+- `GET /user/{user_id}/history`
+- `GET /user/{user_id}/health-score`
 
 ## Setup
 
@@ -62,14 +270,6 @@ Copy-Item .env.example .env
 
 Then configure `.env`:
 
-- Live LLM calls use AWS Bedrock only
-- The app now creates Bedrock clients from `.env`, so temporary AWS session credentials can be set directly in the file
-- Set `AWS_DEFAULT_REGION` or `BEDROCK_REGION`
-- Set `BEDROCK_REASONING_MODEL` and `BEDROCK_FAST_MODEL`
-- Set `USE_MOCK_LLM=true` only if you want a fully offline demo flow
-
-Key config values:
-
 - `AWS_ACCESS_KEY_ID`
 - `AWS_SECRET_ACCESS_KEY`
 - `AWS_SESSION_TOKEN`
@@ -78,9 +278,12 @@ Key config values:
 - `BEDROCK_FAST_MODEL=deepseek.v3.2`
 - `DATABASE_URL=sqlite:///./grab_collections.db`
 - `COMMITMENT_FREEZE_THRESHOLD=2`
-- `API_URL` for the Streamlit app defaults to `http://localhost:8000`
+- `API_URL=http://localhost:8000`
+- `USE_MOCK_LLM=false`
 
-## Seed demo data
+Set `USE_MOCK_LLM=true` only if you want a fully offline demo flow.
+
+## Seed Demo Data
 
 ```powershell
 .\.venv\Scripts\python.exe data/generate_synthetic_data.py
@@ -91,10 +294,10 @@ The generator creates:
 - 10 synthetic workers
 - 60 days of earnings per worker
 - overdue payment records
-- seeded financial health scores
-- historical accepted-plan breaches for selected personas
+- financial health scores
+- seeded accepted-plan breaches for selected personas
 
-## Run the app
+## Run The App
 
 Backend:
 
@@ -108,65 +311,32 @@ Frontend:
 .\.venv\Scripts\python.exe -m streamlit run ui/app.py
 ```
 
-Open the Streamlit app and choose either `Admin dashboard` or `Worker view`.
+Then open the Streamlit app and choose either `Admin dashboard` or `Worker view`.
 
-## Demo personas
-
-These seeded workers are the easiest ones to use in a walkthrough:
+## Demo Personas
 
 1. `GW001` - Siti Noor
-   Low-risk, steady earner. Good for the basic trigger -> offer -> accept flow.
+   Low-risk, steady earner. Best for the basic trigger-agent preview -> send -> accept flow.
 
 2. `GW002` - Ahmad Razali
-   Medium-risk, more volatile income. Good for trigger -> reject -> counter-offer -> accept.
+   Medium-risk, more volatile income. Good for trigger-agent preview -> send -> reject -> counter-offer.
 
 3. `GW003` - Priya Pillai
-   Hardship profile with a recent income drop. Good for showing softer messaging and more flexible repayment logic.
+   Hardship profile with a recent income drop. Good for softer collections language and drift detection / proactive outreach.
 
 4. `GW004` - Budi Santoso
-   Has one prior broken commitment. Good for showing how another missed payment moves the worker closer to a freeze.
+   Has one prior broken commitment. Good for showing the path toward a freeze.
 
 5. `GW006` - Ravi Kumar
-   Already has two broken commitments and starts in a frozen/escalated state. Good for showing the escalation queue immediately.
+   Already has two broken commitments and starts frozen / escalated. Good for the escalation queue story.
 
-## Main API endpoints
+## Notes And Current Limitations
 
-### Core agent actions
-
-- `POST /trigger-agent` -> runs the graph and returns the agent response
-- `POST /notifications/send` -> runs the graph and stores/delivers a worker notification
-- `GET /drift-scan` -> scans all workers for early default-pattern drift
-- `POST /notifications/send-proactive-checkin` -> delivers a soft proactive check-in to a drifting worker
-- `POST /user-response` -> handles response against a saved agent state
-- `POST /worker/notification-response` -> worker-facing accept/reject/support action
-- `POST /mark-payment-missed` -> records a missed installment and freezes restructuring after threshold
-
-### Admin and worker data
-
-- `GET /users` -> worker list for admin view
-- `GET /dashboard` -> admin summary metrics and escalation queue
-- `GET /worker/{user_id}/overview` -> worker profile, payment, health, earnings, notifications, negotiations, breaches
-- `GET /worker/{user_id}/notifications` -> worker notifications only
-- `GET /user/{user_id}/history` -> negotiations and commitment breaches
-- `GET /user/{user_id}/health-score` -> financial health details
-
-Example calls:
-
-```powershell
-curl -X POST http://localhost:8000/notifications/send `
-  -H "Content-Type: application/json" `
-  -d "{\"user_id\":\"GW001\"}"
-
-curl http://localhost:8000/dashboard
-curl http://localhost:8000/worker/GW001/overview
-```
-
-## Notes and current limitations
-
-- The app has separate admin and worker views, but access control is demo-only today
-- Worker identity is selected from a dropdown in the UI
-- Notifications are persisted in SQLite and shown in the worker view; there is no real push channel
-- The `agent/memory.py` helper exists, but the current UI/API flow relies on database-backed notifications, negotiations, and agent session state
-- Live LLM calls use a shared Bedrock runtime model factory built on `boto3.client(...).invoke_model(...)`, matching the sample request shape, and all LangGraph agent LLM calls read model IDs and AWS credentials from `.env`
+- The app is still demo-only; there is no real auth layer
+- Worker identity is selected manually in the UI
+- The worker notification surface is an in-app card / popup-style surface, not a real push notification system
+- Notifications, negotiations, breaches, and agent session state are persisted in SQLite
+- `agent/memory.py` exists, but the current flow is mostly DB-backed rather than memory-backed
+- Live LLM calls use Bedrock runtime through the shared model factory
 - All currency is shown in SGD
-- Payment scheduling and seeded demo data use `Asia/Singapore`
+- Payment scheduling and seeded data use `Asia/Singapore`

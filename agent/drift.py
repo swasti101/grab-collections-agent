@@ -15,6 +15,10 @@ WEEKDAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", 
 DRIFT_THRESHOLD = float(os.getenv("DRIFT_SCORE_THRESHOLD", "0.50"))
 
 
+def _money(value: float) -> str:
+    return f"SGD {float(value):.2f}"
+
+
 def _safe_mode_hour(series: pd.Series) -> int:
     modes = series.mode()
     if modes.empty:
@@ -216,6 +220,65 @@ def _drift_summary_lines(metrics: dict, similarity_count: int, total_defaults: i
     ]
 
 
+def _worker_trace_steps(metrics: dict) -> list[dict]:
+    return [
+        {
+            "step_number": 1,
+            "title": "Analyze worker income baseline",
+            "tools_called": ["earnings_history_lookup", "payment_lookup"],
+            "analysis": [
+                f"Loaded the worker's baseline earnings pattern and the most recent activity window for {metrics['user_id']}.",
+                f"Due context: {metrics['due_context']}.",
+            ],
+            "result": (
+                f"Baseline avg income {_money(metrics['baseline_avg_income'])}; "
+                f"recent avg income {_money(metrics['recent_avg_income'])}."
+            ),
+        },
+        {
+            "step_number": 2,
+            "title": "Analyze timing drift and activity consistency",
+            "tools_called": ["timing_shift_detector", "consistency_monitor"],
+            "analysis": [
+                f"Peak hour moved from {_format_hour(metrics['baseline_peak_hour'])} to {_format_hour(metrics['recent_peak_hour'])}.",
+                f"Active-day ratio moved from {metrics['baseline_active_ratio']:.0%} to {metrics['recent_active_ratio']:.0%}.",
+            ],
+            "result": f"Timing drift {metrics['timing_drift_hours']} hour(s); consistency drop {metrics['consistency_drop']:.0%}.",
+        },
+        {
+            "step_number": 3,
+            "title": "Compare recent earning pattern to baseline",
+            "tools_called": ["weekday_pattern_correlation"],
+            "analysis": [
+                "Compared the current week-shape against the worker's own baseline earning rhythm.",
+            ],
+            "result": f"Pattern correlation {metrics['pattern_correlation']:.2f}; earnings drop {metrics['income_drop_ratio']:.0%}.",
+        },
+        {
+            "step_number": 4,
+            "title": "Compare against historical default patterns",
+            "tools_called": ["historical_similarity_match"],
+            "analysis": [
+                "Compared the worker's current drift vector against workers with prior broken commitments or frozen cases.",
+            ],
+            "result": (
+                f"Matched {metrics['similarity_count']} of {metrics['total_default_patterns']} reference default pattern(s). "
+                f"Final drift score {metrics['drift_score']:.2f}."
+            ),
+        },
+        {
+            "step_number": 5,
+            "title": "Draft proactive check-in",
+            "tools_called": [f"bedrock.invoke_model ({get_model_factory().fast_model_id})"],
+            "analysis": [
+                "Drafted a soft support-first message with no collections wording.",
+                "The message is meant for early outreach before the worker fully slips into a missed-payment pattern.",
+            ],
+            "result": metrics.get("preview_message") or "No proactive message drafted.",
+        },
+    ]
+
+
 def scan_all_workers() -> list[dict]:
     with get_session() as session:
         payments = session.exec(select(Payment).order_by(Payment.user_id)).all()
@@ -254,6 +317,7 @@ def scan_all_workers() -> list[dict]:
         row["total_default_patterns"] = total_defaults
         row["summary_lines"] = _drift_summary_lines(row, similarity_count, total_defaults)
         row["preview_message"] = generate_proactive_checkin_message(row) if drifting else ""
+        row["trace_steps"] = _worker_trace_steps(row)
         row["can_send_checkin"] = drifting and row["latest_proactive_status"] not in {
             "proactive_unread",
             "proactive_options_requested",
@@ -263,3 +327,189 @@ def scan_all_workers() -> list[dict]:
 
     results.sort(key=lambda item: item["drift_score"], reverse=True)
     return results
+
+
+def scan_all_workers_with_trace() -> dict:
+    results = scan_all_workers()
+    drifting = [row for row in results if row.get("drifting")]
+    return {
+        "scan_trace": [
+            {
+                "step_number": 1,
+                "title": "Load worker portfolio for income analysis",
+                "tools_called": ["payment_lookup", "earnings_history_lookup"],
+                "analysis": ["Loaded every worker's payment record and recent earnings history."],
+                "result": f"Prepared {len(results)} worker profile(s) for drift analysis.",
+            },
+            {
+                "step_number": 2,
+                "title": "Establish reference default patterns",
+                "tools_called": ["historical_default_profile_builder"],
+                "analysis": ["Built a reference set from workers with broken commitments, frozen restructuring, or escalated status."],
+                "result": "Historical drift signatures are ready for comparison.",
+            },
+            {
+                "step_number": 3,
+                "title": "Analyze drift across the portfolio",
+                "tools_called": ["timing_shift_detector", "consistency_monitor", "weekday_pattern_correlation", "historical_similarity_match"],
+                "analysis": ["Calculated timing drift, active-day consistency drop, weekly-pattern mismatch, earnings drop, and historical similarity for each worker."],
+                "result": f"Flagged {len(drifting)} worker(s) above the drift threshold of {DRIFT_THRESHOLD:.2f}.",
+            },
+            {
+                "step_number": 4,
+                "title": "Draft proactive check-ins",
+                "tools_called": [f"bedrock.invoke_model ({get_model_factory().fast_model_id})"],
+                "analysis": ["Drafted support-first messages only for workers who crossed the drift threshold."],
+                "result": "Proactive message previews are ready for admin review before sending.",
+            },
+        ],
+        "results": results,
+    }
+
+
+def stream_drift_scan_with_trace():
+    with get_session() as session:
+        payments = session.exec(select(Payment).order_by(Payment.user_id)).all()
+    if not payments:
+        yield {
+            "event": "completed",
+            "scan_trace": [],
+            "results": [],
+        }
+        return
+
+    yield {
+        "event": "step",
+        "step": {
+            "step_number": 1,
+            "title": "Load worker portfolio for income analysis",
+            "tools_called": ["payment_lookup", "earnings_history_lookup"],
+            "analysis": ["Loaded every worker's payment record and recent earnings history."],
+            "result": f"Prepared {len(payments)} worker profile(s) for drift analysis.",
+        },
+    }
+
+    default_ids = _default_reference_ids(payments)
+    yield {
+        "event": "step",
+        "step": {
+            "step_number": 2,
+            "title": "Establish reference default patterns",
+            "tools_called": ["historical_default_profile_builder"],
+            "analysis": ["Built a reference set from workers with broken commitments, frozen restructuring, or escalated status."],
+            "result": "Historical drift signatures are ready for comparison.",
+        },
+    }
+
+    metrics_rows = []
+    for payment in payments:
+        yield {
+            "event": "worker_progress",
+            "worker_id": payment.user_id,
+            "message": f"Analyzing recent earning behaviour for {payment.user_id}.",
+        }
+        metrics_rows.append(_base_drift_features(payment))
+
+    vectors = {row["user_id"]: _feature_vector(row) for row in metrics_rows}
+    default_vectors = {user_id: vector for user_id, vector in vectors.items() if user_id in default_ids}
+
+    yield {
+        "event": "step",
+        "step": {
+            "step_number": 3,
+            "title": "Analyze drift across the portfolio",
+            "tools_called": ["timing_shift_detector", "consistency_monitor", "weekday_pattern_correlation", "historical_similarity_match"],
+            "analysis": ["Calculated timing drift, active-day consistency drop, weekly-pattern mismatch, earnings drop, and historical similarity for each worker."],
+            "result": "Scoring each worker for default-pattern drift.",
+        },
+    }
+
+    results = []
+    for row in metrics_rows:
+        comparisons = [
+            float(np.linalg.norm(vectors[row["user_id"]] - default_vector))
+            for ref_id, default_vector in default_vectors.items()
+            if ref_id != row["user_id"]
+        ]
+        similarity_count = len([distance for distance in comparisons if distance <= 0.9])
+        total_defaults = len(comparisons)
+        similarity_ratio = (similarity_count / total_defaults) if total_defaults else 0.0
+        feature_vector = vectors[row["user_id"]]
+        drift_score = float(
+            0.24 * feature_vector[0]
+            + 0.22 * feature_vector[1]
+            + 0.22 * feature_vector[2]
+            + 0.20 * feature_vector[3]
+            + 0.12 * similarity_ratio
+        )
+        drifting = drift_score >= DRIFT_THRESHOLD and (
+            row["timing_drift_hours"] >= 2 or row["consistency_drop"] >= 0.12 or row["income_drop_ratio"] >= 0.15
+        )
+        row["drift_score"] = round(drift_score, 2)
+        row["drifting"] = drifting
+        row["similarity_count"] = similarity_count
+        row["total_default_patterns"] = total_defaults
+        row["summary_lines"] = _drift_summary_lines(row, similarity_count, total_defaults)
+        row["preview_message"] = generate_proactive_checkin_message(row) if drifting else ""
+        row["trace_steps"] = _worker_trace_steps(row)
+        row["can_send_checkin"] = drifting and row["latest_proactive_status"] not in {
+            "proactive_unread",
+            "proactive_options_requested",
+            "proactive_support_requested",
+        }
+        results.append(row)
+        yield {
+            "event": "worker_result",
+            "worker_id": row["user_id"],
+            "drift_score": row["drift_score"],
+            "drifting": row["drifting"],
+        }
+
+    results.sort(key=lambda item: item["drift_score"], reverse=True)
+    drifting = [row for row in results if row.get("drifting")]
+
+    yield {
+        "event": "step",
+        "step": {
+            "step_number": 4,
+            "title": "Draft proactive check-ins",
+            "tools_called": [f"bedrock.invoke_model ({get_model_factory().fast_model_id})"],
+            "analysis": ["Drafted support-first messages only for workers who crossed the drift threshold."],
+            "result": f"Prepared proactive check-in previews for {len(drifting)} drifting worker(s).",
+        },
+    }
+
+    yield {
+        "event": "completed",
+        "scan_trace": [
+            {
+                "step_number": 1,
+                "title": "Load worker portfolio for income analysis",
+                "tools_called": ["payment_lookup", "earnings_history_lookup"],
+                "analysis": ["Loaded every worker's payment record and recent earnings history."],
+                "result": f"Prepared {len(results)} worker profile(s) for drift analysis.",
+            },
+            {
+                "step_number": 2,
+                "title": "Establish reference default patterns",
+                "tools_called": ["historical_default_profile_builder"],
+                "analysis": ["Built a reference set from workers with broken commitments, frozen restructuring, or escalated status."],
+                "result": "Historical drift signatures are ready for comparison.",
+            },
+            {
+                "step_number": 3,
+                "title": "Analyze drift across the portfolio",
+                "tools_called": ["timing_shift_detector", "consistency_monitor", "weekday_pattern_correlation", "historical_similarity_match"],
+                "analysis": ["Calculated timing drift, active-day consistency drop, weekly-pattern mismatch, earnings drop, and historical similarity for each worker."],
+                "result": f"Flagged {len(drifting)} worker(s) above the drift threshold of {DRIFT_THRESHOLD:.2f}.",
+            },
+            {
+                "step_number": 4,
+                "title": "Draft proactive check-ins",
+                "tools_called": [f"bedrock.invoke_model ({get_model_factory().fast_model_id})"],
+                "analysis": ["Drafted support-first messages only for workers who crossed the drift threshold."],
+                "result": "Proactive message previews are ready for admin review before sending.",
+            },
+        ],
+        "results": results,
+    }

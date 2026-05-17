@@ -21,6 +21,10 @@ class SendNotificationRequest(BaseModel):
     user_id: str
 
 
+class SendPreviewNotificationRequest(BaseModel):
+    state_id: str
+
+
 class SendProactiveCheckInRequest(BaseModel):
     user_id: str
     message: str

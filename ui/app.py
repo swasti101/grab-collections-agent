@@ -1,3 +1,4 @@
+import json
 import os
 import re
 from datetime import datetime
@@ -165,6 +166,23 @@ st.markdown(
     .drift-preview {border-left:3px solid #8e846a;padding-left:12px;color:#ddd7cb;font-style:italic;font-size:1.03rem;line-height:1.5;margin:14px 0;}
     .drift-meta {color:#c7c3bc;font-weight:800;line-height:1.45;}
     .pill-proactive {display:inline-block;border-radius:999px;padding:3px 10px;font-weight:900;font-size:.78rem;background:#f3eee3;color:#59442a;border:1px solid #cdbb98;}
+    .trace-card {padding:14px 16px;margin:10px 0;}
+    .trace-title {font-size:1rem;font-weight:900;color:#fff;margin-bottom:6px;}
+    .trace-meta {color:#c7c3bc;font-weight:800;font-size:.84rem;margin-bottom:10px;}
+    .trace-list {margin:0;padding-left:18px;color:#e7e3db;line-height:1.5;}
+    .trace-result {border-left:2px solid #6f6b62;padding-left:12px;color:#f5f2ec;font-weight:700;line-height:1.5;margin-top:12px;}
+    .review-card {padding:16px;margin-top:14px;}
+    .review-label {color:#bdb9b1;font-size:.84rem;font-weight:900;letter-spacing:.03em;}
+    .flow-shell {margin:12px 0 18px;}
+    .flow-title {color:#bdb9b1;font-size:.84rem;font-weight:900;letter-spacing:.03em;margin-bottom:10px;}
+    .flow-track {display:flex;align-items:stretch;gap:10px;flex-wrap:wrap;}
+    .flow-node {min-width:220px;max-width:280px;flex:1 1 220px;border:1px solid #4a4a47;border-radius:10px;background:#262624;padding:12px;}
+    .flow-node.flow-active {border-color:#d3c08b;background:#2f2c24;}
+    .flow-step {color:#bdb9b1;font-size:.78rem;font-weight:900;letter-spacing:.03em;margin-bottom:6px;}
+    .flow-name {color:#fff;font-size:.95rem;font-weight:900;line-height:1.35;margin-bottom:8px;}
+    .flow-tools {color:#d4cebe;font-size:.8rem;font-weight:800;line-height:1.4;margin-bottom:8px;}
+    .flow-result {color:#ece7dc;font-size:.82rem;line-height:1.45;}
+    .flow-arrow {display:flex;align-items:center;justify-content:center;color:#978d79;font-size:1.2rem;font-weight:900;min-width:26px;}
     div[data-testid="stButton"] button {border-radius:8px;font-weight:800;}
     div[data-testid="stDataFrame"] {border:1px solid #3f3f3d;border-radius:8px;}
     </style>
@@ -178,6 +196,17 @@ def api(method: str, path: str, **kwargs):
         resp = client.request(method, f"{API_URL}{path}", **kwargs)
         resp.raise_for_status()
         return resp.json()
+
+
+def stream_api_events(method: str, path: str, **kwargs):
+    timeout = kwargs.pop("timeout", None)
+    with httpx.Client(timeout=timeout) as client:
+        with client.stream(method, f"{API_URL}{path}", **kwargs) as resp:
+            resp.raise_for_status()
+            for line in resp.iter_lines():
+                if not line:
+                    continue
+                yield json.loads(line)
 
 
 def money(value: float) -> str:
@@ -367,6 +396,174 @@ def render_metric(label: str, value: str, subtitle: str = "", tone: str = ""):
         """,
         unsafe_allow_html=True,
     )
+
+
+def _short_result(value: str, limit: int = 120) -> str:
+    text = plain_text(value)
+    if len(text) <= limit:
+        return text
+    return text[: limit - 3].rstrip() + "..."
+
+
+def flow_arrows_html(trace_steps: list[dict], active_step_number: int | None = None) -> str:
+    items = []
+    for index, step in enumerate(trace_steps):
+        step_number = int(step.get("step_number", index + 1))
+        tools = ", ".join(step.get("tools_called") or ["No explicit tool"])
+        node_class = "flow-node flow-active" if active_step_number == step_number else "flow-node"
+        items.append(
+            f"""
+            <div class="{node_class}">
+              <div class="flow-step">STEP {step_number}</div>
+              <div class="flow-name">{escape(step.get('title', 'Step'))}</div>
+              <div class="flow-tools">Tools: {escape(tools)}</div>
+              <div class="flow-result">{escape(_short_result(step.get('result', '')))}</div>
+            </div>
+            """
+        )
+        if index < len(trace_steps) - 1:
+            items.append('<div class="flow-arrow">-&gt;</div>')
+    return f"""
+    <div class="flow-shell">
+      <div class="flow-title">FLOW OF ANALYSIS</div>
+      <div class="flow-track">{''.join(items)}</div>
+    </div>
+    """
+
+
+def render_flow_arrows(trace_steps: list[dict], active_step_number: int | None = None):
+    if not trace_steps:
+        return
+    st.markdown(flow_arrows_html(trace_steps, active_step_number=active_step_number), unsafe_allow_html=True)
+
+
+def render_trace_flow(title: str, trace_steps: list[dict], key_prefix: str):
+    with st.status(title, expanded=True) as status:
+        for step in trace_steps:
+            status.write(f"Step {step.get('step_number', '?')}: {step.get('title', 'Step completed')}")
+        status.update(label=f"{title} complete", state="complete")
+
+    render_flow_arrows(trace_steps)
+
+    for step in trace_steps:
+        tools = ", ".join(step.get("tools_called") or ["No explicit tool"])
+        analysis = "".join(f"<li>{escape(item)}</li>" for item in step.get("analysis") or [])
+        st.markdown(
+            f"""
+            <div class="panel trace-card">
+              <div class="trace-title">Step {int(step.get('step_number', 0))}: {escape(step.get('title', 'Step'))}</div>
+              <div class="trace-meta">LangGraph node: {escape(step.get('langgraph_node', 'n/a'))} | Tools: {escape(tools)}</div>
+              <ul class="trace-list">{analysis}</ul>
+              <div class="trace-result">{escape(plain_text(step.get('result', '')))}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+
+def render_admin_notification_preview(preview: dict, heading: str):
+    notification = preview.get("notification_preview") or preview
+    plan = notification.get("repayment_plan") or {}
+    lines = []
+    for idx, item in enumerate(plan.get("installments") or [], start=1):
+        lines.append(
+            f"<div class='plan-line'><div>Installment {idx}</div><div>{sgd(item.get('amount', 0))}</div><div>{fmt_date(str(item.get('due_date', '')))}</div></div>"
+        )
+    plan_html = (
+        f"<div class='plan-box'><b>Plan that will be sent</b>{''.join(lines)}</div>"
+        if lines
+        else ""
+    )
+    kind = notification.get("notification_type", "collections")
+    css_class = "notification-proactive" if kind == "proactive_checkin" else "notification-collection"
+    title = "Proactive check-in preview" if kind == "proactive_checkin" else heading
+    st.markdown(
+        f"""
+        <div class="panel review-card">
+          <div class="review-label">REVIEW BEFORE SEND</div>
+          <div class="notification {css_class}" style="margin-bottom:0;">
+            <b>{escape(title)}</b><br>
+            {escape(notification.get('message') or '')}
+            {plan_html}
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def run_agent_preview_live(user_id: str):
+    live_status = st.status("Running collections agent preview", expanded=True)
+    current_step = st.empty()
+    flow_placeholder = st.empty()
+    trace_steps: list[dict] = []
+    preview = None
+    try:
+        for event in stream_api_events("POST", "/agent-preview/stream", json={"user_id": user_id}, timeout=None):
+            if event.get("event") == "started":
+                live_status.write(f"Starting LangGraph run for {user_id}.")
+                current_step.info("Agent starting.")
+            elif event.get("event") == "step":
+                step = event["step"]
+                trace_steps.append(step)
+                live_status.write(f"Step {step['step_number']}: {step['title']}")
+                current_step.info(f"Currently running: {step['title']}")
+                flow_placeholder.markdown(
+                    flow_arrows_html(trace_steps, active_step_number=step["step_number"]),
+                    unsafe_allow_html=True,
+                )
+            elif event.get("event") == "completed":
+                preview = event.get("preview")
+        live_status.update(label="Collections preview complete", state="complete")
+        current_step.success("Agent run complete. Review the draft below before sending.")
+        if trace_steps:
+            flow_placeholder.markdown(flow_arrows_html(trace_steps), unsafe_allow_html=True)
+        return preview
+    except httpx.HTTPError as exc:
+        live_status.update(label="Collections preview failed", state="error")
+        current_step.error(f"Preview failed: {exc}")
+        raise
+
+
+def run_drift_scan_live():
+    live_status = st.status("Running drift scan", expanded=True)
+    current_step = st.empty()
+    flow_placeholder = st.empty()
+    scan = None
+    trace_steps: list[dict] = []
+    try:
+        for event in stream_api_events("GET", "/drift-scan/stream", timeout=None):
+            if event.get("event") == "started":
+                live_status.write("Starting portfolio-wide drift scan.")
+                current_step.info("Loading worker portfolio.")
+            elif event.get("event") == "step":
+                step = event["step"]
+                trace_steps.append(step)
+                live_status.write(f"Step {step['step_number']}: {step['title']}")
+                current_step.info(f"Currently running: {step['title']}")
+                flow_placeholder.markdown(
+                    flow_arrows_html(trace_steps, active_step_number=step["step_number"]),
+                    unsafe_allow_html=True,
+                )
+            elif event.get("event") == "worker_progress":
+                live_status.write(event.get("message", "Analyzing worker"))
+                current_step.info(event.get("message", "Analyzing worker"))
+            elif event.get("event") == "worker_result":
+                status_text = "drifting" if event.get("drifting") else "stable"
+                live_status.write(
+                    f"{event.get('worker_id')}: drift score {float(event.get('drift_score') or 0):.2f} ({status_text})"
+                )
+            elif event.get("event") == "completed":
+                scan = event.get("scan")
+        live_status.update(label="Drift scan complete", state="complete")
+        current_step.success("Drift scan complete. Review the candidates below before sending any check-in.")
+        if trace_steps:
+            flow_placeholder.markdown(flow_arrows_html(trace_steps), unsafe_allow_html=True)
+        return scan
+    except httpx.HTTPError as exc:
+        live_status.update(label="Drift scan failed", state="error")
+        current_step.error(f"Drift scan failed: {exc}")
+        raise
 
 
 def set_role(role: str):
@@ -624,26 +821,44 @@ def render_escalations(dashboard: dict):
 
 def render_trigger_agent(users: list[dict]):
     st.markdown(
-        '<p class="metric-subtle">Manually trigger the agent for a specific worker. This fires the graph and delivers a notification to their view.</p>',
+        '<p class="metric-subtle">Run the LangGraph collections agent for a specific worker, inspect the full step-by-step trace and draft notification, then explicitly approve the send.</p>',
         unsafe_allow_html=True,
     )
     labels = {
         f"{u['user_id']} - {u['name']} ({str(u['risk_tier']).title()} risk)": u["user_id"]
         for u in users
     }
-    c1, c2 = st.columns([4, 1.1])
+    c1, c2, c3 = st.columns([4, 1.2, 1.1])
     selected = c1.selectbox("Worker", labels.keys(), label_visibility="collapsed")
-    if c2.button("Trigger agent", type="primary", use_container_width=True, key="trigger_agent_btn"):
-        result = api("POST", "/notifications/send", json={"user_id": labels[selected]})
-        st.session_state["last_trigger"] = result
-        refresh_admin()
-        st.success(f"Notification delivered to {labels[selected]}")
+    selected_user_id = labels[selected]
+    if c2.button("Run preview", type="primary", use_container_width=True, key="trigger_agent_preview_btn"):
+        st.session_state["agent_preview"] = run_agent_preview_live(selected_user_id)
+        st.session_state.pop("last_trigger", None)
+    if c3.button("Clear preview", use_container_width=True, key="clear_agent_preview"):
+        st.session_state.pop("agent_preview", None)
+        st.session_state.pop("last_trigger", None)
+        st.rerun()
+
+    preview = st.session_state.get("agent_preview")
+    if preview and preview.get("user_id") == selected_user_id:
+        render_trace_flow("Running collections agent preview", preview.get("trace_steps") or [], "agent_preview")
+        render_admin_notification_preview(preview, "Collections notification preview")
+        send_cols = st.columns([1.2, 3])
+        if send_cols[0].button("Send to worker", type="primary", use_container_width=True, key="send_previewed_notification"):
+            result = api("POST", "/notifications/send-previewed", json={"state_id": preview["state_id"]})
+            st.session_state["last_trigger"] = result
+            st.session_state.pop("agent_preview", None)
+            refresh_admin()
+            st.success(f"Notification delivered to {selected_user_id}")
+            st.rerun()
+        send_cols[1].caption("Send Notification will deliver the message previewed above, without changes.")
+
     if st.session_state.get("last_trigger"):
         notification = st.session_state["last_trigger"]["notification"]
         st.markdown(
             f"""
             <div class="panel">
-              <b>Last triggered:</b> {escape(notification['user_id'])} |
+              <b>Last delivered:</b> {escape(notification['user_id'])} |
               {fmt_date(notification['created_at'])} | Status: notification delivered
             </div>
             """,
@@ -653,15 +868,16 @@ def render_trigger_agent(users: list[dict]):
 
 def render_drift_scanner():
     st.markdown(
-        '<p class="metric-subtle">Run one scan across the full worker base, spot drift before a missed payment happens, and send a soft proactive check-in instead of a collections message.</p>',
+        '<p class="metric-subtle">Run one portfolio-wide scan, inspect what the detector is analyzing, review the proactive message draft, and only send after explicit approval.</p>',
         unsafe_allow_html=True,
     )
     c1, c2 = st.columns([1.25, 4])
     if c1.button("Run drift scanner", type="primary", use_container_width=True, key="run_drift_scanner"):
-        st.session_state["drift_scan"] = api("GET", "/drift-scan")
-        st.rerun()
+        st.session_state["drift_scan"] = run_drift_scan_live()
+        st.session_state.pop("last_drift_send", None)
     if c2.button("Clear scan", use_container_width=True, key="clear_drift_scan"):
         st.session_state.pop("drift_scan", None)
+        st.session_state.pop("last_drift_send", None)
         st.rerun()
 
     scan = st.session_state.get("drift_scan")
@@ -679,6 +895,8 @@ def render_drift_scanner():
     with metric_cols[2]:
         max_score = max((float(row.get("drift_score") or 0) for row in drifting), default=0)
         render_metric("Highest drift", f"{max_score:.2f}", "score out of 1.00")
+
+    render_trace_flow("Running drift scanner preview", scan.get("scan_trace") or [], "drift_scan")
 
     if not drifting:
         st.success("No workers crossed the drift threshold on this run.")
@@ -704,11 +922,22 @@ def render_drift_scanner():
             """,
             unsafe_allow_html=True,
         )
+        render_trace_flow(f"Explain drift logic for {row['user_id']}", row.get("trace_steps") or [], f"drift_{row['user_id']}")
+        render_admin_notification_preview(
+            {
+                "notification_preview": {
+                    "notification_type": "proactive_checkin",
+                    "message": row.get("preview_message") or "",
+                    "repayment_plan": {},
+                }
+            },
+            "Proactive check-in preview",
+        )
         sent_status = str(row.get("latest_proactive_status") or "")
         can_send = bool(row.get("can_send_checkin"))
         label = f"Send check-in to {row['user_id']}"
         if st.button(label, type="primary", use_container_width=True, key=f"drift_send_{row['user_id']}", disabled=not can_send):
-            api(
+            result = api(
                 "POST",
                 "/notifications/send-proactive-checkin",
                 json={
@@ -717,12 +946,25 @@ def render_drift_scanner():
                     "drift_summary": "\n".join(row.get("summary_lines") or []),
                 },
             )
+            st.session_state["last_drift_send"] = result
             st.session_state["drift_scan"] = api("GET", "/drift-scan")
             refresh_admin()
             st.success(f"Proactive check-in delivered to {row['user_id']}")
             st.rerun()
+        st.caption("This proactive message is only sent after you press the send button.")
         if sent_status and not can_send:
             st.caption(f"Open proactive check-in already exists: {sent_status.replace('proactive_', '').replace('_', ' ').title()}")
+    if st.session_state.get("last_drift_send"):
+        notification = st.session_state["last_drift_send"]["notification"]
+        st.markdown(
+            f"""
+            <div class="panel">
+              <b>Last proactive check-in sent:</b> {escape(notification['user_id'])} |
+              {fmt_date(notification['created_at'])} | Status: delivered
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
 
 def render_admin():
